@@ -546,15 +546,17 @@ enum TunableSetting: Int, CaseIterable, Identifiable {
     case keyboardReflection = 7
     case keyboardTilt = 8
     case keyboardReach = 9
-    case keyboardBacklight = 10
-    case keyboardDepthBlur = 11
-    case keyboardOffset = 12
-    case keyboardWidth = 13
+    case keyboardParallax = 10
+    case keyboardPitch = 11
+    case keyboardBacklight = 12
+    case keyboardDepthBlur = 13
+    case keyboardOffset = 14
+    case keyboardWidth = 15
 
     // MARK: - Head Tracking & 3D Parallax Settings
-    case headTrackingMode = 14
-    case headParallax = 15
-    case headElevation = 16
+    case headTrackingMode = 16
+    case headParallax = 17
+    case headElevation = 18
 
     var id: Int { rawValue }
 
@@ -563,11 +565,15 @@ enum TunableSetting: Int, CaseIterable, Identifiable {
     }
 
     static var keyboardSettings: [TunableSetting] {
-        [.keyboardReflection, .keyboardTilt, .keyboardReach, .keyboardBacklight, .keyboardDepthBlur, .keyboardOffset, .keyboardWidth]
+        [.keyboardReflection, .keyboardTilt, .keyboardReach, .keyboardParallax, .keyboardPitch, .keyboardBacklight, .keyboardDepthBlur, .keyboardOffset, .keyboardWidth]
     }
 
     static var headTrackingSettings: [TunableSetting] {
         [.headTrackingMode, .headParallax, .headElevation]
+    }
+
+    static var allDisplayedSettings: [TunableSetting] {
+        perspectiveSettings + keyboardSettings + headTrackingSettings
     }
 
     var title: String {
@@ -586,6 +592,8 @@ enum TunableSetting: Int, CaseIterable, Identifiable {
         case .keyboardDepthBlur: return "Keyboard Depth Blur"
         case .keyboardOffset: return "Bottom Offset"
         case .keyboardWidth: return "Keyboard Width"
+        case .keyboardParallax: return "Keyboard Parallax (X)"
+        case .keyboardPitch: return "Keyboard Tilt (Y)"
         case .headTrackingMode: return "Head Tracking Mode"
         case .headParallax: return "Lateral Parallax (X)"
         case .headElevation: return "Vertical Parallax (Y)"
@@ -597,14 +605,24 @@ struct PerspectivePreset: Equatable {
     var keystoneStrength: Float
     var stretchBalance: Float
     var lowAngleCompensation: Float
+    var lookaheadTime: Double
+    var keyboardReach: Float
+    var keyboardOffset: Float
+    var keyboardParallaxSensitivity: Float
+    var keyboardPitchSensitivity: Float
     var headParallaxSensitivity: Float
     var headElevationSensitivity: Float
 
     /// Calibrated settings active when camera head tracking is enabled (.continuous or .snapshotOnClose)
     static let cameraMode = PerspectivePreset(
-        keystoneStrength: 0.17,
-        stretchBalance: 0.52,
-        lowAngleCompensation: 0.25,
+        keystoneStrength: 0.28,
+        stretchBalance: 0.36,
+        lowAngleCompensation: 0.30,
+        lookaheadTime: 0.28,
+        keyboardReach: 0.38,
+        keyboardOffset: -0.03,
+        keyboardParallaxSensitivity: 0.30,
+        keyboardPitchSensitivity: 2.50,
         headParallaxSensitivity: 0.55,
         headElevationSensitivity: 0.70
     )
@@ -614,6 +632,11 @@ struct PerspectivePreset: Equatable {
         keystoneStrength: 0.18,
         stretchBalance: 0.56,
         lowAngleCompensation: 1.00,
+        lookaheadTime: 0.40,
+        keyboardReach: 0.38,
+        keyboardOffset: -0.01,
+        keyboardParallaxSensitivity: 1.00,
+        keyboardPitchSensitivity: 1.00,
         headParallaxSensitivity: 1.00,
         headElevationSensitivity: 1.00
     )
@@ -657,10 +680,12 @@ final class OverlayViewState: ObservableObject {
 
     @Published var headParallaxSensitivity: Float = 0.55
     @Published var headElevationSensitivity: Float = 0.70
-    @Published var keystoneStrength: Float = 0.17
-    @Published var stretchBalance: Float = 0.52
-    @Published var lowAngleCompensation: Float = 0.25
-    @Published var lookaheadTime: Double = 0.4
+    @Published var keyboardParallaxSensitivity: Float = 0.30
+    @Published var keyboardPitchSensitivity: Float = 2.50
+    @Published var keystoneStrength: Float = 0.28
+    @Published var stretchBalance: Float = 0.36
+    @Published var lowAngleCompensation: Float = 0.30
+    @Published var lookaheadTime: Double = 0.28
     @Published var activationCount: Int = 0
     @Published var isKeyboardReflectionEnabled: Bool = true
     @Published var keyboardReflection: Float = 0.44
@@ -669,7 +694,7 @@ final class OverlayViewState: ObservableObject {
     @Published var keyboardTilt: Float = 0.40
     @Published var keyboardReach: Float = 0.38
     @Published var keyboardBacklight: Float = 1.50
-    @Published var keyboardOffset: Float = -0.01
+    @Published var keyboardOffset: Float = -0.03
     @Published var keyboardWidth: Float = 0.88
     @Published var keyboardDepthBlur: Float = 0.30
     @Published var blurIntensity: Float = 1.00
@@ -699,14 +724,20 @@ final class OverlayViewState: ObservableObject {
     var onSettleCompleted: (() -> Void)?
 
     func nextSetting() {
-        let count = TunableSetting.allCases.count
-        selectedSettingIndex = (selectedSettingIndex + 1) % count
+        let list = TunableSetting.allDisplayedSettings
+        let current = TunableSetting(rawValue: selectedSettingIndex) ?? list[0]
+        let currentIndex = list.firstIndex(of: current) ?? 0
+        let nextIndex = (currentIndex + 1) % list.count
+        selectedSettingIndex = list[nextIndex].rawValue
         requestRender()
     }
 
     func previousSetting() {
-        let count = TunableSetting.allCases.count
-        selectedSettingIndex = (selectedSettingIndex - 1 + count) % count
+        let list = TunableSetting.allDisplayedSettings
+        let current = TunableSetting(rawValue: selectedSettingIndex) ?? list[0]
+        let currentIndex = list.firstIndex(of: current) ?? 0
+        let prevIndex = (currentIndex - 1 + list.count) % list.count
+        selectedSettingIndex = list[prevIndex].rawValue
         requestRender()
     }
 
@@ -740,7 +771,7 @@ final class OverlayViewState: ObservableObject {
                 frostedGlass = min(max(frostedGlass + step * 0.05, 0.0), 1.0)
             }
         case .keyboardTilt:
-            keyboardTilt = min(max(keyboardTilt + step * 0.05, 0.15), 2.0)
+            keyboardTilt = min(max(keyboardTilt + step * 0.05, 0.15), 2.50)
         case .keyboardReach:
             keyboardReach = min(max(keyboardReach + step * 0.02, 0.12), 0.65)
         case .keyboardBacklight:
@@ -749,6 +780,12 @@ final class OverlayViewState: ObservableObject {
             keyboardOffset = min(max(keyboardOffset + step * 0.01, -0.10), 0.20)
         case .keyboardWidth:
             keyboardWidth = min(max(keyboardWidth + step * 0.02, 0.60), 1.00)
+        case .keyboardParallax:
+            let newKP = round((keyboardParallaxSensitivity + step * 0.05) * 100) / 100
+            keyboardParallaxSensitivity = min(max(newKP, 0.0), 2.5)
+        case .keyboardPitch:
+            let newKY = round((keyboardPitchSensitivity + step * 0.05) * 100) / 100
+            keyboardPitchSensitivity = min(max(newKY, 0.0), 2.5)
         case .keyboardDepthBlur:
             keyboardDepthBlur = min(max(keyboardDepthBlur + step * 0.05, 0.0), 3.0)
         case .blurIntensity:
@@ -785,6 +822,11 @@ final class OverlayViewState: ObservableObject {
                 keystoneStrength: keystoneStrength,
                 stretchBalance: stretchBalance,
                 lowAngleCompensation: lowAngleCompensation,
+                lookaheadTime: lookaheadTime,
+                keyboardReach: keyboardReach,
+                keyboardOffset: keyboardOffset,
+                keyboardParallaxSensitivity: keyboardParallaxSensitivity,
+                keyboardPitchSensitivity: keyboardPitchSensitivity,
                 headParallaxSensitivity: headParallaxSensitivity,
                 headElevationSensitivity: headElevationSensitivity
             )
@@ -793,6 +835,11 @@ final class OverlayViewState: ObservableObject {
                 keystoneStrength: keystoneStrength,
                 stretchBalance: stretchBalance,
                 lowAngleCompensation: lowAngleCompensation,
+                lookaheadTime: lookaheadTime,
+                keyboardReach: keyboardReach,
+                keyboardOffset: keyboardOffset,
+                keyboardParallaxSensitivity: keyboardParallaxSensitivity,
+                keyboardPitchSensitivity: keyboardPitchSensitivity,
                 headParallaxSensitivity: headParallaxSensitivity,
                 headElevationSensitivity: headElevationSensitivity
             )
@@ -803,6 +850,11 @@ final class OverlayViewState: ObservableObject {
         keystoneStrength = nextPreset.keystoneStrength
         stretchBalance = nextPreset.stretchBalance
         lowAngleCompensation = nextPreset.lowAngleCompensation
+        lookaheadTime = nextPreset.lookaheadTime
+        keyboardReach = nextPreset.keyboardReach
+        keyboardOffset = nextPreset.keyboardOffset
+        keyboardParallaxSensitivity = nextPreset.keyboardParallaxSensitivity
+        keyboardPitchSensitivity = nextPreset.keyboardPitchSensitivity
         headParallaxSensitivity = nextPreset.headParallaxSensitivity
         headElevationSensitivity = nextPreset.headElevationSensitivity
 
@@ -812,30 +864,29 @@ final class OverlayViewState: ObservableObject {
 
     func resetToDefaults() {
         let isCamera = (HeadTracker.shared.mode != .disabled)
+        let preset: PerspectivePreset = isCamera ? .cameraMode : .manualMode
         if isCamera {
             cameraPreset = .cameraMode
-            keystoneStrength = PerspectivePreset.cameraMode.keystoneStrength
-            stretchBalance = PerspectivePreset.cameraMode.stretchBalance
-            lowAngleCompensation = PerspectivePreset.cameraMode.lowAngleCompensation
-            headParallaxSensitivity = PerspectivePreset.cameraMode.headParallaxSensitivity
-            headElevationSensitivity = PerspectivePreset.cameraMode.headElevationSensitivity
         } else {
             manualPreset = .manualMode
-            keystoneStrength = PerspectivePreset.manualMode.keystoneStrength
-            stretchBalance = PerspectivePreset.manualMode.stretchBalance
-            lowAngleCompensation = PerspectivePreset.manualMode.lowAngleCompensation
-            headParallaxSensitivity = PerspectivePreset.manualMode.headParallaxSensitivity
-            headElevationSensitivity = PerspectivePreset.manualMode.headElevationSensitivity
         }
-        lookaheadTime = 0.4
+        keystoneStrength = preset.keystoneStrength
+        stretchBalance = preset.stretchBalance
+        lowAngleCompensation = preset.lowAngleCompensation
+        lookaheadTime = preset.lookaheadTime
+        keyboardReach = preset.keyboardReach
+        keyboardOffset = preset.keyboardOffset
+        keyboardParallaxSensitivity = preset.keyboardParallaxSensitivity
+        keyboardPitchSensitivity = preset.keyboardPitchSensitivity
+        headParallaxSensitivity = preset.headParallaxSensitivity
+        headElevationSensitivity = preset.headElevationSensitivity
+
         isKeyboardReflectionEnabled = true
         keyboardReflection = 0.44
         isFrostedGlassEnabled = true
         frostedGlass = 0.10
         keyboardTilt = 0.40
-        keyboardReach = 0.38
         keyboardBacklight = 1.50
-        keyboardOffset = -0.01
         keyboardWidth = 0.88
         keyboardDepthBlur = 0.30
         blurIntensity = 1.00
@@ -852,6 +903,11 @@ final class OverlayViewState: ObservableObject {
         self.keystoneStrength = initial.keystoneStrength
         self.stretchBalance = initial.stretchBalance
         self.lowAngleCompensation = initial.lowAngleCompensation
+        self.lookaheadTime = initial.lookaheadTime
+        self.keyboardReach = initial.keyboardReach
+        self.keyboardOffset = initial.keyboardOffset
+        self.keyboardParallaxSensitivity = initial.keyboardParallaxSensitivity
+        self.keyboardPitchSensitivity = initial.keyboardPitchSensitivity
         self.headParallaxSensitivity = initial.headParallaxSensitivity
         self.headElevationSensitivity = initial.headElevationSensitivity
 
@@ -1431,6 +1487,8 @@ private struct FullscreenPerspectiveContainer: View {
                 headTracker: headTracker,
                 headParallaxSensitivity: state.headParallaxSensitivity,
                 headElevationSensitivity: state.headElevationSensitivity,
+                keyboardParallaxSensitivity: state.keyboardParallaxSensitivity,
+                keyboardPitchSensitivity: state.keyboardPitchSensitivity,
                 sensor: sensor,
                 fallbackAngle: sensor.currentAngle,
                 lookahead: state.lookaheadTime,
@@ -1933,6 +1991,8 @@ private struct WarpedSettingsCardContainer: View {
         case .keyboardBacklight: return String(format: "%.2f", state.keyboardBacklight)
         case .keyboardOffset: return String(format: "%+.2f", state.keyboardOffset)
         case .keyboardWidth: return String(format: "%.2f", state.keyboardWidth)
+        case .keyboardParallax: return String(format: "%.2fx", state.keyboardParallaxSensitivity)
+        case .keyboardPitch: return String(format: "%.2fx", state.keyboardPitchSensitivity)
         case .keyboardDepthBlur: return String(format: "%.2f", state.keyboardDepthBlur)
         case .blurIntensity:
             return state.blurIntensity <= 0.01 ? "Off" : String(format: "%.2f", state.blurIntensity)
@@ -1962,6 +2022,8 @@ private struct WarpedSettingsCardContainer: View {
         case .keyboardBacklight: return Double(state.keyboardBacklight / 2.5)
         case .keyboardOffset: return Double((state.keyboardOffset + 0.10) / 0.30)
         case .keyboardWidth: return Double((state.keyboardWidth - 0.60) / 0.40)
+        case .keyboardParallax: return Double(state.keyboardParallaxSensitivity / 2.5)
+        case .keyboardPitch: return Double(state.keyboardPitchSensitivity / 2.5)
         case .keyboardDepthBlur: return Double(state.keyboardDepthBlur / 3.0)
         case .blurIntensity: return Double(state.blurIntensity / 2.0)
         case .shadowIntensity: return Double(state.shadowIntensity / 2.0)

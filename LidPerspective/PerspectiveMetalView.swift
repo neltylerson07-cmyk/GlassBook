@@ -14,6 +14,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
     var headTracker: HeadTracker = HeadTracker.shared
     var headParallaxSensitivity: Float = 1.0
     var headElevationSensitivity: Float = 1.0
+    var keyboardParallaxSensitivity: Float = 0.85
+    var keyboardPitchSensitivity: Float = 0.85
     var sensor: LidSensor? = nil
     var fallbackAngle: Double = 90.0
     var lookahead: Double = 0.4
@@ -77,6 +79,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
         context.coordinator.headTracker = headTracker
         context.coordinator.headParallaxSensitivity = headParallaxSensitivity
         context.coordinator.headElevationSensitivity = headElevationSensitivity
+        context.coordinator.keyboardParallaxSensitivity = keyboardParallaxSensitivity
+        context.coordinator.keyboardPitchSensitivity = keyboardPitchSensitivity
 
         if isSettling && !context.coordinator.isSettling {
             context.coordinator.startSettling()
@@ -191,6 +195,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
         var headTracker: HeadTracker = HeadTracker.shared
         var headParallaxSensitivity: Float = 1.0
         var headElevationSensitivity: Float = 1.0
+        var keyboardParallaxSensitivity: Float = 0.85
+        var keyboardPitchSensitivity: Float = 0.85
         private var clockProgress: Float = 0.0
         private var lastFrameTime: CFTimeInterval = 0.0
         private var clockTexture: MTLTexture?
@@ -247,8 +253,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
             var headTrackingActive: Float
             var headParallaxSensitivity: Float
             var headElevationSensitivity: Float
-            var pad1: Float = 0.0
-            var pad2: Float = 0.0
+            var keyboardParallaxSensitivity: Float
+            var keyboardPitchSensitivity: Float
         }
 
         override init() {
@@ -515,8 +521,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 headTrackingActive: head.isTracking ? 1.0 : 0.0,
                 headParallaxSensitivity: self.headParallaxSensitivity,
                 headElevationSensitivity: self.headElevationSensitivity,
-                pad1: 0.0,
-                pad2: 0.0
+                keyboardParallaxSensitivity: self.keyboardParallaxSensitivity,
+                keyboardPitchSensitivity: self.keyboardPitchSensitivity
             )
 
             encoder.setRenderPipelineState(pipelineState)

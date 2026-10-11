@@ -33,10 +33,10 @@ struct PerspectiveUniforms {
     float headZ;              // Head distance ratio (0.5 to 2.2, 1.0 = nominal ~50cm)
     float headTrackingActive; // 1.0 if head tracking is active, 0.0 otherwise
     // Dynamic Head Tracking Tunables (16 bytes)
-    float headParallaxSensitivity;  // Lateral shear sensitivity (0.0 to 2.5, default 1.0)
-    float headElevationSensitivity; // Vertical tilt sensitivity (0.0 to 2.5, default 1.0)
-    float pad1;
-    float pad2;
+    float headParallaxSensitivity;     // Lateral shear sensitivity (0.0 to 2.5, default 1.0)
+    float headElevationSensitivity;    // Vertical tilt sensitivity (0.0 to 2.5, default 1.0)
+    float keyboardParallaxSensitivity; // Keyboard lateral reflection shear with headX (0.0 to 2.5, default 0.85)
+    float keyboardPitchSensitivity;    // Keyboard tilt & reach foreshortening with headY (0.0 to 2.5, default 0.85)
 };
 
 vertex RasterizerData vertex_main(uint vertexID [[vertex_id]]) {
@@ -234,22 +234,29 @@ static float4 sampleKeyboardReflection(float2 finalUV,
     // Distance from bottom hinge (finalUV.y = 1.0) upward into the display
     float vY = max(1.0f - finalUV.y, 0.0f) + uniforms.keyboardOffset;
     float maxReach = clamp(uniforms.keyboardReach, 0.12f, 0.65f);
-    
-    if (vY < 0.0f || vY > maxReach || finalUV.x < 0.0f || finalUV.x > 1.0f) {
+
+    // Dynamic 3D Head Tracking for Keyboard Ground Plane:
+    // Vertical head motion (headY): reversed to match viewpoint pitch
+    float headPitchMod = 1.0f - (uniforms.headY * 0.35f * uniforms.keyboardPitchSensitivity) * uniforms.headTrackingActive;
+    float effectiveReach = clamp(maxReach * headPitchMod, 0.10f, 0.75f);
+    float tilt = max(uniforms.keyboardTilt * headPitchMod, 0.10f);
+
+    if (vY < 0.0f || vY > effectiveReach || finalUV.x < 0.0f || finalUV.x > 1.0f) {
         return float4(0.0f);
     }
 
-    // Perspective foreshortening:
-    // tilt controls the pitch/angle of the keyboard plane (flatter grazing angle compresses keys vertically)
-    float tilt = max(uniforms.keyboardTilt, 0.10f);
-    
     // Normalized distance on the ground plane (0.0 at hinge, 1.0 at max reach)
-    float normY = vY / maxReach;
+    float normY = vY / effectiveReach;
 
     // Linear keystone taper across the angled plane (straight lines remain straight)
     float taper = 1.0f + normY * (0.45f * tilt);
-    float headReflectShift = uniforms.headX * (0.12f * normY * uniforms.headParallaxSensitivity) * uniforms.headTrackingActive;
-    float X = (finalUV.x - 0.5f + headReflectShift) * taper;
+
+    // Horizontal head motion (headX): reversed to match user viewpoint shift
+    float headParallaxMod = -uniforms.headX * (0.35f * uniforms.keyboardParallaxSensitivity) * uniforms.headTrackingActive;
+    float headReflectShift = headParallaxMod * (0.35f + 0.65f * normY);
+    float headKeystoneAsymmetry = 1.0f + (finalUV.x - 0.5f) * headParallaxMod * 0.45f;
+
+    float X = (finalUV.x - 0.5f + headReflectShift) * taper * headKeystoneAsymmetry;
 
     // Keyboard well bounds
     float halfW = clamp(uniforms.keyboardWidth * 0.5f, 0.30f, 0.495f);
