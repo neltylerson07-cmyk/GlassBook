@@ -62,16 +62,14 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         context.coordinator.onSettleCompleted = onSettleCompleted
         context.coordinator.onRippleCompleted = onRippleCompleted
 
-        if isSettling && !context.coordinator.isSettling {
+        if isSettling && !context.coordinator.isSettling && !context.coordinator.hasFinishedSettle {
             context.coordinator.startSettling()
-        } else if !isSettling && context.coordinator.isSettling {
+        } else if !isSettling && (context.coordinator.isSettling || context.coordinator.hasFinishedSettle) {
             context.coordinator.cancelSettling()
         }
 
         if isRippling && !context.coordinator.isRippling {
             context.coordinator.triggerRipple(onCompleted: onRippleCompleted)
-        } else if !isRippling && context.coordinator.isRippling {
-            context.coordinator.cancelRipple()
         }
 
         context.coordinator.updateParameters(
@@ -103,6 +101,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         var onRippleCompleted: (() -> Void)? = nil
         private var introStartTime: CFTimeInterval = 0.0
         private let introDuration: CFTimeInterval = 0.20
+        private(set) var hasFinishedSettle: Bool = false
 
         func reset(angle: Double) {
             let initial = min(angle, 90.0)
@@ -110,6 +109,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             self.targetAngle = initial
             self.isFirstFrame = true
             self.isSettling = false
+            self.hasFinishedSettle = false
             self.hasFiredFirstFrame = false
             self.introStartTime = CACurrentMediaTime()
             cancelRipple()
@@ -203,14 +203,17 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         }
 
         func startSettling() {
-            guard !isSettling else { return }
+            guard !isSettling && !hasFinishedSettle else { return }
             isSettling = true
+            hasFinishedSettle = false
             settleStartTime = CACurrentMediaTime()
             frozenAngle = smoothedAngle
         }
 
         func cancelSettling() {
             isSettling = false
+            hasFinishedSettle = false
+            settleStartTime = 0.0
             cancelRipple()
         }
 
@@ -311,6 +314,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
 
                 if t >= 1.0 {
                     isSettling = false
+                    hasFinishedSettle = true
                     settleFactor = 1.0
                     if isRippleEnabled && !isRippling {
                         triggerRipple { [weak self] in
@@ -322,7 +326,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                         }
                     }
                 }
-            } else if isRippling {
+            } else if isRippling || hasFinishedSettle {
                 settleFactor = 1.0
             }
 

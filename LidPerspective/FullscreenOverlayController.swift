@@ -232,7 +232,9 @@ final class FullscreenOverlayController: ObservableObject {
             // Reset settle state when showing fresh overlay
             viewState.activationCount += 1
             viewState.isSettling = false
+            viewState.isRippling = false
             viewState.onSettleCompleted = nil
+            viewState.onRippleCompleted = nil
             viewState.showCalibrator = showCalibrator
             viewState.screenSize = screen.frame.size
             viewState.currentSnapshot = builtinSnapshot
@@ -404,13 +406,23 @@ final class FullscreenOverlayController: ObservableObject {
         }
         viewState.isSettling = true
         viewState.onSettleCompleted = { [weak self] in
-            self?.fadeAndDismissBuiltin(completion: completion)
+            guard let self = self else {
+                completion?()
+                return
+            }
+            self.viewState.isSettling = false
+            self.viewState.isRippling = false
+            self.fadeAndDismissBuiltin(completion: completion)
         }
     }
 
     /// Smoothly fades out the built-in overlay window to reveal the live desktop underneath.
     func fadeAndDismissBuiltin(completion: (() -> Void)? = nil) {
         headTracker.releaseTracking()
+        viewState.isSettling = false
+        viewState.isRippling = false
+        viewState.onSettleCompleted = nil
+        viewState.onRippleCompleted = nil
         guard let activeWindow = builtinWindow else {
             completion?()
             return
@@ -477,6 +489,7 @@ final class FullscreenOverlayController: ObservableObject {
         if viewState.isSettling {
             let prevHandler = viewState.onSettleCompleted
             viewState.onSettleCompleted = { [weak self] in
+                self?.viewState.isRippling = false
                 prevHandler?()
                 completion?()
             }
@@ -488,6 +501,7 @@ final class FullscreenOverlayController: ObservableObject {
                 completion?()
                 return
             }
+            self.viewState.isRippling = false
             if self.builtinWindow != nil {
                 self.fadeAndDismissBuiltin(completion: completion)
             } else {

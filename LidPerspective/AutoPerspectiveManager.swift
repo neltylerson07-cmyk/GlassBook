@@ -113,6 +113,7 @@ final class AutoPerspectiveManager: ObservableObject {
     private var clockTimerTask: Task<Void, Never>?
     private var dwellReferenceAngle: Double = 90.0
     private var lastSettledAngle: Double?
+    private var lastDismissalTime: CFTimeInterval = 0.0
 
     init(
         sensor: LidSensor,
@@ -166,12 +167,14 @@ final class AutoPerspectiveManager: ObservableObject {
                     cancelAllDwellTimers()
                     overlayController.deactivateClockMode()
                     statusDescription = "At 90.0° — Settling complete"
+                    self.lastDismissalTime = CACurrentMediaTime()
                     overlayController.trigger90DegreeRippleDismiss { [weak self] in
                         guard let self = self else { return }
+                        self.lastDismissalTime = CACurrentMediaTime()
                         self.captureManager.cancelPrecapture()
-                        self.isArmed = true
+                        self.isArmed = false
                         self.lastSettledAngle = nil
-                        self.statusDescription = "Armed — Close lid (<90°) to activate"
+                        self.statusDescription = "Open lid past 92° to re-arm"
                     }
                 }
                 return
@@ -186,11 +189,6 @@ final class AutoPerspectiveManager: ObservableObject {
                 return
             }
 
-            // If user closed the lid back down while rippling, cancel ripple and resume perspective
-            if overlayController.viewState.isRippling {
-                overlayController.cancelSettling()
-            }
-
             // Overlay active between minUsableAngle and closeThreshold
             let velocity = abs(sensor.latestVelocity)
             let angleDelta = abs(angle - dwellReferenceAngle)
@@ -203,8 +201,8 @@ final class AutoPerspectiveManager: ObservableObject {
                     overlayController.deactivateClockMode()
                 }
 
-                // If user resumes moving while settling, resume animations
-                if overlayController.isSettling || overlayController.isExternalSettling {
+                // If user resumes moving while settling or rippling, cancel and resume perspective animations
+                if overlayController.isSettling || overlayController.isExternalSettling || overlayController.viewState.isRippling {
                     overlayController.cancelSettling()
                 }
 
@@ -272,11 +270,11 @@ final class AutoPerspectiveManager: ObservableObject {
                 lastSettledAngle = nil
                 triggerPerspective()
             } else if let settledAngle = lastSettledAngle {
-                // Screen was settled at a low angle. Check if user adjusts the lid again!
+                // Screen was settled at a low angle. Check if user deliberately adjusts the lid again!
                 let velocity = abs(sensor.latestVelocity)
                 let angleDelta = abs(angle - settledAngle)
-                if velocity > 1.4 || angleDelta > 0.8 {
-                    // Lid adjustment detected! Reactivate perspective mode
+                if (velocity > 2.0 && angleDelta > 1.2) || angleDelta > 3.0 {
+                    // Deliberate lid adjustment detected! Reactivate perspective mode
                     lastSettledAngle = nil
                     triggerPerspective()
                 }
@@ -369,8 +367,9 @@ final class AutoPerspectiveManager: ObservableObject {
 
         overlayController.unwarpAndDismissBuiltin { [weak self] in
             guard let self = self else { return }
-            self.lastSettledAngle = settledAngle
-            self.statusDescription = String(format: "Screen ready (%.1f°) — Adjust lid to reactivate", settledAngle)
+            self.lastDismissalTime = CACurrentMediaTime()
+            self.lastSettledAngle = self.sensor.displayAngle
+            self.statusDescription = String(format: "Screen ready (%.1f°) — Adjust lid to reactivate", self.sensor.displayAngle)
         }
     }
 
@@ -387,6 +386,9 @@ final class AutoPerspectiveManager: ObservableObject {
             }
             return
         }
+
+        // Debounce: prevent re-triggering during or immediately after dismissal cooldown
+        guard CACurrentMediaTime() - lastDismissalTime > 0.8 else { return }
 
         cancelAllDwellTimers()
         dwellReferenceAngle = sensor.displayAngle
@@ -449,23 +451,22 @@ final class AutoPerspectiveManager: ObservableObject {
     }
 
     private func handleOverlayDismissed() {
+        lastDismissalTime = CACurrentMediaTime()
         cancelAllDwellTimers()
         overlayController.deactivateClockMode()
         captureManager.invalidateSnapshots()
         if sensor.displayAngle < closeThreshold && sensor.displayAngle >= minUsableAngle {
             isArmed = false
-            if lastSettledAngle == nil {
-                lastSettledAngle = sensor.displayAngle
-            }
+            lastSettledAngle = sensor.displayAngle
             statusDescription = String(format: "Screen ready (%.1f°) — Adjust lid to reactivate", sensor.displayAngle)
-        } else if sensor.displayAngle >= closeThreshold {
+        } else if sensor.displayAngle >= rearmThreshold {
             isArmed = true
             lastSettledAngle = nil
             statusDescription = "Armed — Close lid (<90°) to activate"
         } else {
             isArmed = false
             lastSettledAngle = nil
-            statusDescription = "Exited — Open lid past 90° to re-arm"
+            statusDescription = "Open lid past 92° to re-arm"
         }
     }
 
@@ -476,13 +477,13 @@ final class AutoPerspectiveManager: ObservableObject {
         if !isAutoModeEnabled {
             statusDescription = "Automatic mode disabled"
         } else {
-            if sensor.displayAngle >= closeThreshold {
+            if sensor.displayAngle >= rearmThreshold {
                 isArmed = true
                 statusDescription = "Armed — Close lid (<90°) to activate"
             } else {
                 isArmed = false
                 lastSettledAngle = sensor.displayAngle >= minUsableAngle ? sensor.displayAngle : nil
-                statusDescription = "Open lid past 90° to arm automatic mode"
+                statusDescription = "Open lid past 92° to arm automatic mode"
             }
         }
     }
