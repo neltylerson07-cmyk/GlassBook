@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 @main
 struct LidPerspectiveApp: App {
@@ -7,6 +8,7 @@ struct LidPerspectiveApp: App {
     @StateObject private var bootstrap: AppBootstrap
     @StateObject private var overlayController: FullscreenOverlayController
     @StateObject private var autoManager: AutoPerspectiveManager
+    @StateObject private var headTracker = HeadTracker.shared
 
     init() {
         let sensorInstance = LidSensor()
@@ -33,7 +35,8 @@ struct LidPerspectiveApp: App {
                 sensor: sensor,
                 autoManager: autoManager,
                 overlayController: overlayController,
-                bootstrap: bootstrap
+                bootstrap: bootstrap,
+                headTracker: headTracker
             )
         }
 
@@ -44,7 +47,8 @@ struct LidPerspectiveApp: App {
                 captureManager: captureManager,
                 bootstrap: bootstrap,
                 overlayController: overlayController,
-                autoManager: autoManager
+                autoManager: autoManager,
+                headTracker: headTracker
             )
         }
         .windowResizability(.contentSize)
@@ -57,6 +61,7 @@ struct MenuBarMenuView: View {
     @ObservedObject var autoManager: AutoPerspectiveManager
     @ObservedObject var overlayController: FullscreenOverlayController
     @ObservedObject var bootstrap: AppBootstrap
+    @ObservedObject var headTracker: HeadTracker
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -140,11 +145,46 @@ struct MenuBarMenuView: View {
                     .disabled(autoManager.isAutoSettleEnabled)
             }
 
+            Menu("Viewing Perspective Reference") {
+                ForEach(HeadTrackingMode.allCases) { mode in
+                    Button {
+                        headTracker.mode = mode
+                    } label: {
+                        if headTracker.mode == mode {
+                            Label(mode.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(mode.rawValue)
+                        }
+                    }
+                }
+            }
+            if headTracker.mode != .disabled {
+                if headTracker.isTrackingFace {
+                    Text(String(format: "Reference: (X: %+.2f, Y: %+.2f, Dist: %.2fx)", headTracker.currentHeadX, headTracker.currentHeadY, headTracker.currentHeadZ))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if headTracker.mode == .snapshotOnClose {
+                    Text("Snaps face once when lid starts closing")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Searching for face...")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Toggle("External Monitor Ambient Effect", isOn: $autoManager.isExternalDisplayEnabled)
             Toggle("Frosted Glass Effect", isOn: overlayController.frostedGlassBinding)
             Toggle("Simulated Keyboard Reflection", isOn: overlayController.keyboardReflectionBinding)
 
             Divider()
+
+            Button {
+                autoManager.triggerPerspective(showCalibrator: true)
+            } label: {
+                Label("Open Calibrator HUD (or Press 'C')", systemImage: "slider.horizontal.2.square")
+            }
 
             Button {
                 NSApp.activate(ignoringOtherApps: true)
@@ -172,6 +212,7 @@ struct ContentView: View {
     @ObservedObject var bootstrap: AppBootstrap
     @ObservedObject var overlayController: FullscreenOverlayController
     @ObservedObject var autoManager: AutoPerspectiveManager
+    @ObservedObject var headTracker: HeadTracker
 
     @State private var isRunningDiagnostics: Bool = false
     @State private var diagnosticMessage: String? = nil
@@ -439,6 +480,120 @@ struct ContentView: View {
 
                 Divider()
 
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text("Viewing Angle Adaptation")
+                                    .font(.body.weight(.medium))
+                                if headTracker.mode != .disabled {
+                                    Circle()
+                                        .fill(headTracker.isTrackingFace ? Color.green : (headTracker.isSnapping ? Color.blue : Color.orange))
+                                        .frame(width: 8, height: 8)
+                                }
+                            }
+                            Text(headTracker.mode.shortDescription)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+
+                        Picker("", selection: $headTracker.mode) {
+                            ForEach(HeadTrackingMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 220)
+                    }
+
+                    if headTracker.mode != .disabled {
+                        VStack(spacing: 8) {
+                            HStack {
+                                Text("Camera Access")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if headTracker.authorizationStatus == .authorized {
+                                    Text("Authorized")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(.green)
+                                } else if headTracker.authorizationStatus == .notDetermined {
+                                    Button("Grant Access…") {
+                                        headTracker.requestPermission()
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                } else {
+                                    Text("Denied")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(.red)
+                                }
+                            }
+
+                            if headTracker.authorizationStatus == .denied {
+                                HStack {
+                                    Text("Camera permission is denied. Enable it in macOS System Settings.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("Open Settings…") {
+                                        headTracker.openCameraSettings()
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                }
+                                .padding(.top, 2)
+                            }
+
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(headTracker.mode == .snapshotOnClose ? "Viewing Reference" : "Live Tracking")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    if headTracker.isTrackingFace {
+                                        HStack(spacing: 12) {
+                                            Text(String(format: "X: %+.2f", headTracker.currentHeadX))
+                                            Text(String(format: "Y: %+.2f", headTracker.currentHeadY))
+                                            Text(String(format: "Dist: %.2fx", headTracker.currentHeadZ))
+                                        }
+                                        .font(.caption2.monospacedDigit().bold())
+                                        .foregroundStyle(.primary)
+                                    } else {
+                                        Text(headTracker.isSnapping ? "Snapping face photo..." : "No reference snapped yet (Close lid to snap)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                Spacer()
+
+                                Button {
+                                    headTracker.captureFaceSnapshot(force: true)
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        if headTracker.isSnapping {
+                                            ProgressView()
+                                                .controlSize(.mini)
+                                        } else {
+                                            Image(systemName: "camera.viewfinder")
+                                        }
+                                        Text(headTracker.isSnapping ? "Snapping…" : "Capture Reference Now")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(headTracker.authorizationStatus != .authorized || headTracker.isSnapping)
+                            }
+                        }
+                        .padding(10)
+                        .background(.quaternary.opacity(0.35))
+                        .cornerRadius(8)
+                    }
+                }
+
+                Divider()
+
                 Toggle(isOn: $autoManager.isExternalDisplayEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("External Display Ambient Animation")
@@ -470,6 +625,16 @@ struct ContentView: View {
             // Secondary actions
             HStack(spacing: 12) {
                 Button {
+                    autoManager.triggerPerspective(showCalibrator: true)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "slider.horizontal.2.square")
+                        Text("Launch Calibrator HUD Now")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
                     runDiagnostics()
                 } label: {
                     HStack {
@@ -497,7 +662,7 @@ struct ContentView: View {
             // Instructions footer
             VStack(alignment: .leading, spacing: 4) {
                 Label("Closing lid (<90°) captures screen and warps in real time", systemImage: "sparkles")
-                Label("When lid is tilted, press 'C' for Calibrator, 'T' for Clock, 'F' for Frosted, or 'K' for Keyboard", systemImage: "slider.horizontal.2.square.badge.arrow.down")
+                Label("When lid is tilted, press 'C' for Calibrator HUD, 'M' for Head Tracking Mode, 'T' for Clock, 'F' for Frosted, or 'K' for Keyboard", systemImage: "slider.horizontal.2.square.badge.arrow.down")
                 Label("Use [↑/↓] and [←/→] to navigate and tune perspective parameters", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
                 if autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0 {
                     Label("Stopping movement (<90°) unwarps and returns to desktop after \(autoManager.formattedDelay)", systemImage: "arrow.triangle.2.circlepath")
@@ -525,8 +690,10 @@ struct ContentView: View {
         .onAppear {
             overlayController.viewState.isSettingsWindowOpen = true
             setupKeyMonitor()
+            headTracker.retainTracking()
         }
         .onDisappear {
+            headTracker.releaseTracking()
             if let monitor = keyMonitor {
                 NSEvent.removeMonitor(monitor)
                 keyMonitor = nil
@@ -566,6 +733,14 @@ struct ContentView: View {
         }
         .onKeyPress(KeyEquivalent("K")) {
             if handleKeyPress("k") { return .handled }
+            return .ignored
+        }
+        .onKeyPress(KeyEquivalent("h")) {
+            if handleKeyPress("h") { return .handled }
+            return .ignored
+        }
+        .onKeyPress(KeyEquivalent("H")) {
+            if handleKeyPress("h") { return .handled }
             return .ignored
         }
         .onKeyPress(KeyEquivalent("t")) {
@@ -655,6 +830,9 @@ struct ContentView: View {
             if overlayController.viewState.showCalibrator {
                 overlayController.viewState.requestRender()
             }
+            return true
+        } else if key.lowercased() == "h" {
+            headTracker.isEnabled.toggle()
             return true
         }
         return false

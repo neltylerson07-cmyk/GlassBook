@@ -51,7 +51,7 @@ final class LidSensor: ObservableObject {
         // When lifting the lid up (effectiveVelocity > 0), make velocity stronger
         // so the animation leads forward responsively and unwarps cleanly
         if effectiveVelocity > 0 {
-            forwardDelta *= 0.25
+            forwardDelta *= 1
         }
 
         // Soft-clamp the maximum projection delta to prevent jarring overshoot

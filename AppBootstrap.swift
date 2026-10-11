@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Cocoa
 import Metal
@@ -42,6 +43,15 @@ final class AppBootstrap: ObservableObject {
             print("✓ ScreenCaptureKit active. Displays found: \(content.displays.count)")
         } catch {
             print("! ScreenCaptureKit note: Permission prompt required or user denied (\(error.localizedDescription))")
+        }
+
+        // 4. FaceTime HD Camera & Vision Face Tracking Verification
+        let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        print("✓ Camera Authorization Status: \(cameraStatus.rawValue)")
+        if let defaultCamera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) ?? AVCaptureDevice.default(for: .video) {
+            print("✓ Built-in Camera Device: \(defaultCamera.localizedName)")
+        } else {
+            print("! No video capture device found")
         }
     }
 }

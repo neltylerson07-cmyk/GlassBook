@@ -14,6 +14,26 @@ final class FullscreenOverlayController: ObservableObject {
     var onExternalSettleCompleted: (() -> Void)?
     private var onDismissal: (() -> Void)?
     @Published var viewState = OverlayViewState()
+    let headTracker: HeadTracker = HeadTracker.shared
+    private var cancellables = Set<AnyCancellable>()
+
+    init() {
+        headTracker.$mode
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newMode in
+                self?.viewState.updateForTrackingMode(newMode)
+            }
+            .store(in: &cancellables)
+    }
+
+    var headTrackingBinding: Binding<Bool> {
+        Binding(
+            get: { self.headTracker.isEnabled },
+            set: { [weak self] newValue in
+                self?.headTracker.isEnabled = newValue
+            }
+        )
+    }
 
     // External Monitor Tunable Parameters
     @Published var externalZoomOut: Float = 0.10
@@ -106,12 +126,18 @@ final class FullscreenOverlayController: ObservableObject {
         }
         newWindow.onToggleCalibrator = { [weak self] in
             guard let self = self else { return }
-            guard self.viewState.isSettingsWindowAvailable else { return }
-            if !self.viewState.showCalibrator && sensor.displayAngle >= 90.0 {
-                return
-            }
             self.viewState.showCalibrator.toggle()
             if self.viewState.showCalibrator {
+                self.viewState.requestRender()
+            }
+        }
+        newWindow.onToggleHeadMode = { [weak self] in
+            guard let self = self else { return }
+            let modes = HeadTrackingMode.allCases
+            if let idx = modes.firstIndex(of: self.headTracker.mode) {
+                let next = modes[(idx + 1) % modes.count]
+                self.headTracker.mode = next
+                self.viewState.updateForTrackingMode(next)
                 self.viewState.requestRender()
             }
         }
@@ -161,6 +187,7 @@ final class FullscreenOverlayController: ObservableObject {
         let hostView = NSHostingView(
             rootView: FullscreenPerspectiveContainer(
                 sensor: sensor,
+                headTracker: headTracker,
                 state: viewState,
                 onDismiss: { [weak self] in
                     self?.dismiss()
@@ -208,11 +235,13 @@ final class FullscreenOverlayController: ObservableObject {
             viewState.currentSnapshot = builtinSnapshot
             viewState.currentTexture = snapshots.builtinTextures?.texture
             viewState.currentBlurredTexture = snapshots.builtinTextures?.blurredTexture
+            viewState.updateForTrackingMode(headTracker.mode)
 
             if showCalibrator {
                 viewState.requestRender()
             }
 
+            headTracker.retainTracking()
             prepareBuiltinWindow(sensor: sensor)
 
             if let overlayWindow = builtinWindow {
@@ -351,6 +380,7 @@ final class FullscreenOverlayController: ObservableObject {
 
     /// Smoothly fades out the built-in overlay window to reveal the live desktop underneath.
     func fadeAndDismissBuiltin(completion: (() -> Void)? = nil) {
+        headTracker.releaseTracking()
         guard let activeWindow = builtinWindow else {
             completion?()
             return
@@ -409,6 +439,7 @@ final class FullscreenOverlayController: ObservableObject {
 
     /// Immediate dismissal of all overlays (e.g. lid opened past 90° or ESC pressed).
     func dismiss(completion: (() -> Void)? = nil) {
+        headTracker.releaseTracking()
         cancelSettling()
         deactivateClockMode()
         let activeBuiltin = builtinWindow
@@ -520,6 +551,11 @@ enum TunableSetting: Int, CaseIterable, Identifiable {
     case keyboardOffset = 12
     case keyboardWidth = 13
 
+    // MARK: - Head Tracking & 3D Parallax Settings
+    case headTrackingMode = 14
+    case headParallax = 15
+    case headElevation = 16
+
     var id: Int { rawValue }
 
     static var perspectiveSettings: [TunableSetting] {
@@ -528,6 +564,10 @@ enum TunableSetting: Int, CaseIterable, Identifiable {
 
     static var keyboardSettings: [TunableSetting] {
         [.keyboardReflection, .keyboardTilt, .keyboardReach, .keyboardBacklight, .keyboardDepthBlur, .keyboardOffset, .keyboardWidth]
+    }
+
+    static var headTrackingSettings: [TunableSetting] {
+        [.headTrackingMode, .headParallax, .headElevation]
     }
 
     var title: String {
@@ -546,8 +586,37 @@ enum TunableSetting: Int, CaseIterable, Identifiable {
         case .keyboardDepthBlur: return "Keyboard Depth Blur"
         case .keyboardOffset: return "Bottom Offset"
         case .keyboardWidth: return "Keyboard Width"
+        case .headTrackingMode: return "Head Tracking Mode"
+        case .headParallax: return "Lateral Parallax (X)"
+        case .headElevation: return "Vertical Parallax (Y)"
         }
     }
+}
+
+struct PerspectivePreset: Equatable {
+    var keystoneStrength: Float
+    var stretchBalance: Float
+    var lowAngleCompensation: Float
+    var headParallaxSensitivity: Float
+    var headElevationSensitivity: Float
+
+    /// Calibrated settings active when camera head tracking is enabled (.continuous or .snapshotOnClose)
+    static let cameraMode = PerspectivePreset(
+        keystoneStrength: 0.17,
+        stretchBalance: 0.52,
+        lowAngleCompensation: 0.25,
+        headParallaxSensitivity: 0.55,
+        headElevationSensitivity: 0.70
+    )
+
+    /// Default baseline settings when mode is only manual / disabled (.disabled)
+    static let manualMode = PerspectivePreset(
+        keystoneStrength: 0.18,
+        stretchBalance: 0.56,
+        lowAngleCompensation: 1.00,
+        headParallaxSensitivity: 1.00,
+        headElevationSensitivity: 1.00
+    )
 }
 
 @MainActor
@@ -580,9 +649,17 @@ final class OverlayViewState: ObservableObject {
             }
         }
     }
-    @Published var keystoneStrength: Float = 0.18
-    @Published var stretchBalance: Float = 0.56
-    @Published var lowAngleCompensation: Float = 1.00
+
+    // Active presets for camera vs manual mode
+    var cameraPreset: PerspectivePreset = .cameraMode
+    var manualPreset: PerspectivePreset = .manualMode
+    private var lastModeWasCamera: Bool = (HeadTracker.shared.mode != .disabled)
+
+    @Published var headParallaxSensitivity: Float = 0.55
+    @Published var headElevationSensitivity: Float = 0.70
+    @Published var keystoneStrength: Float = 0.17
+    @Published var stretchBalance: Float = 0.52
+    @Published var lowAngleCompensation: Float = 0.25
     @Published var lookaheadTime: Double = 0.4
     @Published var activationCount: Int = 0
     @Published var isKeyboardReflectionEnabled: Bool = true
@@ -680,14 +757,76 @@ final class OverlayViewState: ObservableObject {
         case .shadowIntensity:
             let newShadow = round((shadowIntensity + step * 0.05) * 100) / 100
             shadowIntensity = min(max(newShadow, 0.0), 2.0)
+        case .headTrackingMode:
+            let modes = HeadTrackingMode.allCases
+            if let idx = modes.firstIndex(of: HeadTracker.shared.mode) {
+                let nextIdx = (idx + direction + modes.count) % modes.count
+                let next = modes[nextIdx]
+                HeadTracker.shared.mode = next
+                updateForTrackingMode(next)
+            }
+        case .headParallax:
+            let newP = round((headParallaxSensitivity + step * 0.05) * 100) / 100
+            headParallaxSensitivity = min(max(newP, 0.0), 2.5)
+        case .headElevation:
+            let newE = round((headElevationSensitivity + step * 0.05) * 100) / 100
+            headElevationSensitivity = min(max(newE, 0.0), 2.5)
         }
         requestRender()
     }
 
+    func updateForTrackingMode(_ newMode: HeadTrackingMode) {
+        let isCamera = (newMode != .disabled)
+        guard isCamera != lastModeWasCamera else { return }
+
+        // Save current values to outgoing mode preset
+        if lastModeWasCamera {
+            cameraPreset = PerspectivePreset(
+                keystoneStrength: keystoneStrength,
+                stretchBalance: stretchBalance,
+                lowAngleCompensation: lowAngleCompensation,
+                headParallaxSensitivity: headParallaxSensitivity,
+                headElevationSensitivity: headElevationSensitivity
+            )
+        } else {
+            manualPreset = PerspectivePreset(
+                keystoneStrength: keystoneStrength,
+                stretchBalance: stretchBalance,
+                lowAngleCompensation: lowAngleCompensation,
+                headParallaxSensitivity: headParallaxSensitivity,
+                headElevationSensitivity: headElevationSensitivity
+            )
+        }
+
+        // Apply incoming mode preset
+        let nextPreset = isCamera ? cameraPreset : manualPreset
+        keystoneStrength = nextPreset.keystoneStrength
+        stretchBalance = nextPreset.stretchBalance
+        lowAngleCompensation = nextPreset.lowAngleCompensation
+        headParallaxSensitivity = nextPreset.headParallaxSensitivity
+        headElevationSensitivity = nextPreset.headElevationSensitivity
+
+        lastModeWasCamera = isCamera
+        requestRender()
+    }
+
     func resetToDefaults() {
-        keystoneStrength = 0.18
-        stretchBalance = 0.56
-        lowAngleCompensation = 1.00
+        let isCamera = (HeadTracker.shared.mode != .disabled)
+        if isCamera {
+            cameraPreset = .cameraMode
+            keystoneStrength = PerspectivePreset.cameraMode.keystoneStrength
+            stretchBalance = PerspectivePreset.cameraMode.stretchBalance
+            lowAngleCompensation = PerspectivePreset.cameraMode.lowAngleCompensation
+            headParallaxSensitivity = PerspectivePreset.cameraMode.headParallaxSensitivity
+            headElevationSensitivity = PerspectivePreset.cameraMode.headElevationSensitivity
+        } else {
+            manualPreset = .manualMode
+            keystoneStrength = PerspectivePreset.manualMode.keystoneStrength
+            stretchBalance = PerspectivePreset.manualMode.stretchBalance
+            lowAngleCompensation = PerspectivePreset.manualMode.lowAngleCompensation
+            headParallaxSensitivity = PerspectivePreset.manualMode.headParallaxSensitivity
+            headElevationSensitivity = PerspectivePreset.manualMode.headElevationSensitivity
+        }
         lookaheadTime = 0.4
         isKeyboardReflectionEnabled = true
         keyboardReflection = 0.44
@@ -707,6 +846,15 @@ final class OverlayViewState: ObservableObject {
     private var appearanceSubscription: AnyCancellable?
 
     init() {
+        let isCamera = (HeadTracker.shared.mode != .disabled)
+        self.lastModeWasCamera = isCamera
+        let initial = isCamera ? PerspectivePreset.cameraMode : PerspectivePreset.manualMode
+        self.keystoneStrength = initial.keystoneStrength
+        self.stretchBalance = initial.stretchBalance
+        self.lowAngleCompensation = initial.lowAngleCompensation
+        self.headParallaxSensitivity = initial.headParallaxSensitivity
+        self.headElevationSensitivity = initial.headElevationSensitivity
+
         if let app = NSApp {
             appearanceSubscription = app.publisher(for: \.effectiveAppearance)
                 .receive(on: DispatchQueue.main)
@@ -1194,6 +1342,7 @@ private class KeyCatchingWindow: NSWindow {
     var onToggleClock: (() -> Void)?
     var onToggleKeyboard: (() -> Void)?
     var onToggleFrostedGlass: (() -> Void)?
+    var onToggleHeadMode: (() -> Void)?
     var onArrowUp: (() -> Void)?
     var onArrowDown: (() -> Void)?
     var onArrowLeft: (() -> Void)?
@@ -1235,12 +1384,16 @@ private class KeyCatchingWindow: NSWindow {
             onToggleKeyboard?()
         case 3: // 'F' key
             onToggleFrostedGlass?()
+        case 46: // 'M' key (Mode toggle)
+            onToggleHeadMode?()
         case 15: // 'R' key
             onReset?()
         default:
             let char = event.charactersIgnoringModifiers?.lowercased()
             if char == "c" {
                 onToggleCalibrator?()
+            } else if char == "m" {
+                onToggleHeadMode?()
             } else if char == "t" {
                 onToggleClock?()
             } else if char == "k" {
@@ -1259,6 +1412,7 @@ private class KeyCatchingWindow: NSWindow {
 // MARK: - Fullscreen Perspective Container
 private struct FullscreenPerspectiveContainer: View {
     let sensor: LidSensor
+    @ObservedObject var headTracker: HeadTracker
     @ObservedObject var state: OverlayViewState
     var onFirstFrame: (() -> Void)? = nil
     let onDismiss: () -> Void
@@ -1274,6 +1428,9 @@ private struct FullscreenPerspectiveContainer: View {
                 showCalibrator: state.showCalibrator,
                 clockImage: state.clockImage,
                 isClockActive: state.isClockActive,
+                headTracker: headTracker,
+                headParallaxSensitivity: state.headParallaxSensitivity,
+                headElevationSensitivity: state.headElevationSensitivity,
                 sensor: sensor,
                 fallbackAngle: sensor.currentAngle,
                 lookahead: state.lookaheadTime,
@@ -1474,6 +1631,28 @@ private struct WarpedSettingsCardContainer: View {
                             isDarkMode: isDarkMode
                         )
                     }
+
+                    // Separation between groups
+                    HStack(spacing: 8) {
+                        Rectangle()
+                            .fill(Color.primary.opacity(isDarkMode ? 0.14 : 0.08))
+                            .frame(height: 1)
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+
+                    // Section 3: Head Tracking & 3D Parallax
+                    sectionHeader(title: "HEAD TRACKING & 3D PARALLAX", icon: "person.crop.circle.badge.checkmark")
+
+                    ForEach(TunableSetting.headTrackingSettings) { setting in
+                        SettingRow(
+                            setting: setting,
+                            isSelected: state.selectedSettingIndex == setting.rawValue,
+                            valueText: formattedValue(for: setting),
+                            progress: progress(for: setting),
+                            isDarkMode: isDarkMode
+                        )
+                    }
                 }
 
                 Divider()
@@ -1487,6 +1666,8 @@ private struct WarpedSettingsCardContainer: View {
                     KeycapHint(keys: ["F"], label: "Frosted", isDarkMode: isDarkMode)
                     Spacer()
                     KeycapHint(keys: ["K"], label: "Keyboard", isDarkMode: isDarkMode)
+                    Spacer()
+                    KeycapHint(keys: ["M"], label: "Mode", isDarkMode: isDarkMode)
                     Spacer()
                     KeycapHint(keys: ["R"], label: "Reset", isDarkMode: isDarkMode)
                     Spacer()
@@ -1757,6 +1938,12 @@ private struct WarpedSettingsCardContainer: View {
             return state.blurIntensity <= 0.01 ? "Off" : String(format: "%.2f", state.blurIntensity)
         case .shadowIntensity:
             return state.shadowIntensity <= 0.01 ? "Off" : String(format: "%.2f", state.shadowIntensity)
+        case .headTrackingMode:
+            return HeadTracker.shared.mode.rawValue
+        case .headParallax:
+            return String(format: "%.2fx", state.headParallaxSensitivity)
+        case .headElevation:
+            return String(format: "%.2fx", state.headElevationSensitivity)
         }
     }
 
@@ -1778,6 +1965,14 @@ private struct WarpedSettingsCardContainer: View {
         case .keyboardDepthBlur: return Double(state.keyboardDepthBlur / 3.0)
         case .blurIntensity: return Double(state.blurIntensity / 2.0)
         case .shadowIntensity: return Double(state.shadowIntensity / 2.0)
+        case .headTrackingMode:
+            let modes = HeadTrackingMode.allCases
+            let idx = modes.firstIndex(of: HeadTracker.shared.mode) ?? 0
+            return Double(idx) / Double(max(modes.count - 1, 1))
+        case .headParallax:
+            return Double(state.headParallaxSensitivity / 2.5)
+        case .headElevation:
+            return Double(state.headElevationSensitivity / 2.5)
         }
     }
 }

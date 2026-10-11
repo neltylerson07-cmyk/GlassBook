@@ -11,6 +11,9 @@ struct PerspectiveMetalView: NSViewRepresentable {
     var showCalibrator: Bool = false
     var clockImage: CGImage? = nil
     var isClockActive: Bool = false
+    var headTracker: HeadTracker = HeadTracker.shared
+    var headParallaxSensitivity: Float = 1.0
+    var headElevationSensitivity: Float = 1.0
     var sensor: LidSensor? = nil
     var fallbackAngle: Double = 90.0
     var lookahead: Double = 0.4
@@ -71,6 +74,9 @@ struct PerspectiveMetalView: NSViewRepresentable {
         context.coordinator.onSettleCompleted = onSettleCompleted
         context.coordinator.showCalibrator = showCalibrator
         context.coordinator.isClockActive = isClockActive
+        context.coordinator.headTracker = headTracker
+        context.coordinator.headParallaxSensitivity = headParallaxSensitivity
+        context.coordinator.headElevationSensitivity = headElevationSensitivity
 
         if isSettling && !context.coordinator.isSettling {
             context.coordinator.startSettling()
@@ -182,6 +188,9 @@ struct PerspectiveMetalView: NSViewRepresentable {
         private var lastLoadedClockID: CGImage?
         var showCalibrator: Bool = false
         var isClockActive: Bool = false
+        var headTracker: HeadTracker = HeadTracker.shared
+        var headParallaxSensitivity: Float = 1.0
+        var headElevationSensitivity: Float = 1.0
         private var clockProgress: Float = 0.0
         private var lastFrameTime: CFTimeInterval = 0.0
         private var clockTexture: MTLTexture?
@@ -232,6 +241,14 @@ struct PerspectiveMetalView: NSViewRepresentable {
             var clockProgress: Float
             var showClock: Float
             var pad0: Float = 0.0
+            var headX: Float
+            var headY: Float
+            var headZ: Float
+            var headTrackingActive: Float
+            var headParallaxSensitivity: Float
+            var headElevationSensitivity: Float
+            var pad1: Float = 0.0
+            var pad2: Float = 0.0
         }
 
         override init() {
@@ -469,6 +486,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
             let aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
             let angleRadians = Float(smoothedAngle * (.pi / 180.0))
 
+            let head = headTracker.getHeadPosition()
+
             var uniforms = PerspectiveUniforms(
                 angle: angleRadians,
                 aspect: aspect,
@@ -489,7 +508,15 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 lowAngleCompensation: self.lowAngleCompensation,
                 clockProgress: self.clockProgress,
                 showClock: (self.clockTexture != nil && self.clockProgress > 0.001) ? 1.0 : 0.0,
-                pad0: 0.0
+                pad0: 0.0,
+                headX: head.x,
+                headY: head.y,
+                headZ: head.z,
+                headTrackingActive: head.isTracking ? 1.0 : 0.0,
+                headParallaxSensitivity: self.headParallaxSensitivity,
+                headElevationSensitivity: self.headElevationSensitivity,
+                pad1: 0.0,
+                pad2: 0.0
             )
 
             encoder.setRenderPipelineState(pipelineState)

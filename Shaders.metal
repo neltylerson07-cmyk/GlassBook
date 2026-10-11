@@ -27,6 +27,16 @@ struct PerspectiveUniforms {
     float clockProgress;      // Smooth transition progress for clock mode & background dimming (0.0 to 1.0)
     float showClock;          // 1.0 if clock texture is active, 0.0 otherwise
     float pad0;               // 16-byte alignment padding
+    // Head Tracking Extensions (16 bytes)
+    float headX;              // Normalized head lateral offset (-1.0 to 1.0, 0.0 = center)
+    float headY;              // Normalized head vertical offset (-1.0 to 1.0, 0.0 = center)
+    float headZ;              // Head distance ratio (0.5 to 2.2, 1.0 = nominal ~50cm)
+    float headTrackingActive; // 1.0 if head tracking is active, 0.0 otherwise
+    // Dynamic Head Tracking Tunables (16 bytes)
+    float headParallaxSensitivity;  // Lateral shear sensitivity (0.0 to 2.5, default 1.0)
+    float headElevationSensitivity; // Vertical tilt sensitivity (0.0 to 2.5, default 1.0)
+    float pad1;
+    float pad2;
 };
 
 vertex RasterizerData vertex_main(uint vertexID [[vertex_id]]) {
@@ -238,7 +248,8 @@ static float4 sampleKeyboardReflection(float2 finalUV,
 
     // Linear keystone taper across the angled plane (straight lines remain straight)
     float taper = 1.0f + normY * (0.45f * tilt);
-    float X = (finalUV.x - 0.5f) * taper;
+    float headReflectShift = uniforms.headX * (0.12f * normY * uniforms.headParallaxSensitivity) * uniforms.headTrackingActive;
+    float X = (finalUV.x - 0.5f + headReflectShift) * taper;
 
     // Keyboard well bounds
     float halfW = clamp(uniforms.keyboardWidth * 0.5f, 0.30f, 0.495f);
@@ -599,19 +610,34 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
     float tiltAmount = sin(delta) * transitionProgress;
     float s = 1.0f - uv.y; // 0.0 at bottom hinge, 1.0 at top bezel
 
-    // Progressive low-angle dual compensation (below 45°):
+    // Progressive low-angle dual compensation (engages below ~80° down to 0°):
     // Simultaneously increases horizontal keystone taper and decreases vertical
     // stretch balance as the lid angle closes toward 0°.
-    const float angle45Rad = 1.3963f; // 45° in radians
+    const float lowAngleOnsetRad = 1.3963f; // ~80° in radians
     float lowAngleKeystoneBoost = 1.0f;
     float lowAngleStretchMultiplier = 1.0f;
-    if (currentTheta < angle45Rad) {
-        float lowAngleProgress = clamp((angle45Rad - currentTheta) / angle45Rad, 0.0f, 1.0f);
-        float compFactor = clamp(uniforms.lowAngleCompensation, 0.0f, 2.0f);
-        // Keystone taper ramps up smoothly below 45°
+    float lowAngleShearBoost = 1.0f;
+
+    if (currentTheta < lowAngleOnsetRad) {
+        float lowAngleProgress = clamp((lowAngleOnsetRad - currentTheta) / lowAngleOnsetRad, 0.0f, 1.0f);
+
+        // Dynamically modulate low-angle compensation based on 3D face position:
+        // - Eye elevation (headY): Looking down from higher up (headY > 0) reduces oblique foreshortening,
+        //   so taper compensation is reduced. Viewing from lower down (headY < 0) grazes the screen plane,
+        //   requiring stronger keystone expansion.
+        // - Distance (headZ): Closer viewing (headZ < 1.0) increases near-field convergence.
+        float faceElevationMod = 1.0f - (uniforms.headY * 0.40f);
+        float faceDistanceMod = clamp(1.0f / max(uniforms.headZ, 0.4f), 0.6f, 1.6f);
+        float faceAdaptedComp = uniforms.lowAngleCompensation * mix(1.0f, faceElevationMod * faceDistanceMod, uniforms.headTrackingActive);
+        float compFactor = clamp(faceAdaptedComp, 0.0f, 2.5f);
+
+        // Keystone taper ramps up smoothly below 80°
         lowAngleKeystoneBoost += compFactor * (0.8f * lowAngleProgress + 0.6f * lowAngleProgress * lowAngleProgress);
-        // Stretch balance drops smoothly below 45°
+        // Stretch balance drops smoothly below 80°
         lowAngleStretchMultiplier -= (1.8f * compFactor) * lowAngleProgress;
+
+        // Enhanced off-axis shear at low angles (receding screen top)
+        lowAngleShearBoost += (0.45f * lowAngleProgress) * uniforms.headTrackingActive;
     }
 
     // Scale effects by transitionProgress and settleFactor
@@ -631,16 +657,22 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
     // Physical screen glass refracts incoming light rays before perspective projection
     float2 effectiveScreenUV = uv + grainRefract;
 
-    // 1. Perspective Depth Coordinate Warping
-    float effectiveKeystone = uniforms.keystoneStrength * transitionProgress * lowAngleKeystoneBoost;
-    float effectiveStretch = max(uniforms.stretchBalance * lowAngleStretchMultiplier, 0.01f);
+    // 1. Perspective Depth Coordinate Warping & Head-Tracked Off-Axis Projection
+    float distanceMod = mix(1.0f, clamp(1.0f / max(uniforms.headZ, 0.5f), 0.6f, 1.8f), uniforms.headTrackingActive);
+    float effectiveKeystone = uniforms.keystoneStrength * transitionProgress * lowAngleKeystoneBoost * distanceMod;
+    float hYMod = 1.0f + uniforms.headY * 0.25f * uniforms.headElevationSensitivity * uniforms.headTrackingActive;
+    float effectiveStretch = max(uniforms.stretchBalance * lowAngleStretchMultiplier * hYMod, 0.01f);
     float w = max(1.0f - (s * tiltAmount * effectiveKeystone), 0.05f);
-    float warpedX = ((effectiveScreenUV.x - 0.5f) / w) + 0.5f;
+
+    // Off-axis lateral shear from head tracking (0 at bottom hinge s=0, maximum at top s=1)
+    float offAxisShearX = -uniforms.headX * (s * tiltAmount * 0.38f * uniforms.headParallaxSensitivity * lowAngleShearBoost) * uniforms.headTrackingActive;
+
+    float warpedX = ((effectiveScreenUV.x - 0.5f + offAxisShearX) / w) + 0.5f;
     float warpedY = 1.0f - (s * (1.0f - (tiltAmount * (1.0f - effectiveStretch))) / w);
     float2 finalUV = float2(warpedX, warpedY);
 
     // Clean perspective projection coordinates (without grain refraction) for UI elements like Calibrator
-    float cleanWarpedX = ((uv.x - 0.5f) / w) + 0.5f;
+    float cleanWarpedX = ((uv.x - 0.5f + offAxisShearX) / w) + 0.5f;
     float2 cleanPerspectiveUV = float2(cleanWarpedX, warpedY);
 
     // 2. Traveling Focus Wavefront Math

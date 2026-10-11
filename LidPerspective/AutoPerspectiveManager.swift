@@ -230,7 +230,7 @@ final class AutoPerspectiveManager: ObservableObject {
             // Pre-warm the builtin overlay window once so show() is 0ms
             overlayController.prepareBuiltinWindow(sensor: sensor)
 
-            // Proactive capture when closing towards 90° or within pre-trigger range
+            // Proactive desktop capture when closing towards 90° (ScreenCaptureKit only, no camera)
             if angle <= 112.0 {
                 let isClosing = sensor.latestVelocity < -0.3 || angle < 95.0
                 if isClosing || !captureManager.isFresh {
@@ -363,6 +363,10 @@ final class AutoPerspectiveManager: ObservableObject {
 
         cancelAllDwellTimers()
         dwellReferenceAngle = sensor.displayAngle
+
+        if HeadTracker.shared.mode == .snapshotOnClose {
+            HeadTracker.shared.captureFaceSnapshot()
+        }
 
         // FAST PATH: If warm snapshots are already in memory, display IMMEDIATELY on this exact stack frame!
         if let immediateSnapshots = captureManager.getImmediateSnapshots() {
