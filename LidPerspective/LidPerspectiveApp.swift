@@ -604,6 +604,19 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
+
+                Divider()
+
+                Toggle(isOn: $overlayController.viewState.isTransitionBlurEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Quick Blur & Fade Transition")
+                            .font(.body.weight(.medium))
+                        Text("Softly blurs and fades between the live desktop and snapshot when perspective activates.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .toggleStyle(.switch)
             .padding()

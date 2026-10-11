@@ -104,6 +104,8 @@ final class AutoPerspectiveManager: ObservableObject {
     let closeThreshold: Double = 90.0
     let rearmThreshold: Double = 92.0 // Hysteresis to prevent jitter near 90°
     let minUsableAngle: Double = 10.0 // Below 10° screen is closing shut
+    let precaptureThreshold: Double = 105.0 // Proactively captures only when closing towards 90°
+    let precaptureCancelThreshold: Double = 110.0
 
     // Separate settle tracking for built-in and external displays
     private var builtinDwellTimerTask: Task<Void, Never>?
@@ -145,15 +147,33 @@ final class AutoPerspectiveManager: ObservableObject {
 
         // If overlay is currently displayed on any screen
         if overlayController.isShowing {
-            if angle >= rearmThreshold {
-                // Lid opened past 90° -> cancel settle, dismiss overlays and re-arm
-                cancelAllDwellTimers()
-                overlayController.deactivateClockMode()
-                overlayController.cancelSettling()
-                overlayController.dismiss()
-                isArmed = true
-                lastSettledAngle = nil
-                statusDescription = "Armed — Close lid (<90°) to activate"
+            if angle >= closeThreshold {
+                // Lid opened to 90° or wider: provide edge ripple feedback that animation is over / at 90°
+                if angle >= rearmThreshold + 8.0 {
+                    // Lid opened far past upright (>100°): cancel settle and dismiss immediately
+                    cancelAllDwellTimers()
+                    overlayController.deactivateClockMode()
+                    overlayController.cancelSettling()
+                    overlayController.dismiss()
+                    captureManager.cancelPrecapture()
+                    isArmed = true
+                    lastSettledAngle = nil
+                    statusDescription = "Armed — Close lid (<90°) to activate"
+                    return
+                }
+
+                if !overlayController.viewState.isRippling && !overlayController.viewState.isSettling {
+                    cancelAllDwellTimers()
+                    overlayController.deactivateClockMode()
+                    statusDescription = "At 90.0° — Settling complete"
+                    overlayController.trigger90DegreeRippleDismiss { [weak self] in
+                        guard let self = self else { return }
+                        self.captureManager.cancelPrecapture()
+                        self.isArmed = true
+                        self.lastSettledAngle = nil
+                        self.statusDescription = "Armed — Close lid (<90°) to activate"
+                    }
+                }
                 return
             }
 
@@ -164,6 +184,11 @@ final class AutoPerspectiveManager: ObservableObject {
                 overlayController.cancelSettling()
                 statusDescription = "Lid closing"
                 return
+            }
+
+            // If user closed the lid back down while rippling, cancel ripple and resume perspective
+            if overlayController.viewState.isRippling {
+                overlayController.cancelSettling()
             }
 
             // Overlay active between minUsableAngle and closeThreshold
@@ -229,14 +254,16 @@ final class AutoPerspectiveManager: ObservableObject {
 
             // Pre-warm the builtin overlay window once so show() is 0ms
             overlayController.prepareBuiltinWindow(sensor: sensor)
+        }
 
-            // Proactive desktop capture when closing towards 90° (ScreenCaptureKit only, no camera)
-            if angle <= 112.0 {
-                let isClosing = sensor.latestVelocity < -0.3 || angle < 95.0
-                if isClosing || !captureManager.isFresh {
+        // Proactive desktop capture when closing towards 90° (ScreenCaptureKit only, no camera)
+        if angle >= closeThreshold {
+            let isClosing = sensor.latestVelocity < -0.6
+            if angle <= precaptureThreshold && isArmed {
+                if isClosing && !captureManager.isFresh {
                     captureManager.precapture()
                 }
-            } else if angle > 115.0 {
+            } else if angle > precaptureCancelThreshold || sensor.latestVelocity > 0.5 {
                 captureManager.cancelPrecapture()
             }
         } else if angle < closeThreshold && angle >= minUsableAngle {
@@ -424,6 +451,7 @@ final class AutoPerspectiveManager: ObservableObject {
     private func handleOverlayDismissed() {
         cancelAllDwellTimers()
         overlayController.deactivateClockMode()
+        captureManager.invalidateSnapshots()
         if sensor.displayAngle < closeThreshold && sensor.displayAngle >= minUsableAngle {
             isArmed = false
             if lastSettledAngle == nil {

@@ -15,6 +15,11 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
     var maxBlur: Float = 1.00
     var maxDarken: Float = 0.40
     var isSettling: Bool = false
+    var isTransitionBlurEnabled: Bool = true
+    var isRippleEnabled: Bool = true
+    var rippleIntensity: Float = 1.00
+    var isRippling: Bool = false
+    var onRippleCompleted: (() -> Void)? = nil
     var onSettleCompleted: (() -> Void)? = nil
     var onFirstFrame: (() -> Void)? = nil
 
@@ -49,14 +54,24 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         }
 
         context.coordinator.onFirstFrame = onFirstFrame
+        context.coordinator.isTransitionBlurEnabled = isTransitionBlurEnabled
+        context.coordinator.isRippleEnabled = isRippleEnabled
+        context.coordinator.rippleIntensity = rippleIntensity
         context.coordinator.sensor = sensor
         context.coordinator.lookahead = lookahead
         context.coordinator.onSettleCompleted = onSettleCompleted
+        context.coordinator.onRippleCompleted = onRippleCompleted
 
         if isSettling && !context.coordinator.isSettling {
             context.coordinator.startSettling()
         } else if !isSettling && context.coordinator.isSettling {
             context.coordinator.cancelSettling()
+        }
+
+        if isRippling && !context.coordinator.isRippling {
+            context.coordinator.triggerRipple(onCompleted: onRippleCompleted)
+        } else if !isRippling && context.coordinator.isRippling {
+            context.coordinator.cancelRipple()
         }
 
         context.coordinator.updateParameters(
@@ -79,14 +94,41 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         var sensor: LidSensor?
         var lookahead: Double = 0.4
         var activationCount: Int = -1
+        var isTransitionBlurEnabled: Bool = true
+        var isRippleEnabled: Bool = true
+        var rippleIntensity: Float = 1.00
+        private(set) var isRippling: Bool = false
+        private var rippleStartTime: CFTimeInterval = 0.0
+        private let rippleDuration: CFTimeInterval = 0.40
+        var onRippleCompleted: (() -> Void)? = nil
+        private var introStartTime: CFTimeInterval = 0.0
+        private let introDuration: CFTimeInterval = 0.20
 
         func reset(angle: Double) {
             let initial = min(angle, 90.0)
-            self.smoothedAngle = initial
+            self.smoothedAngle = 90.0
             self.targetAngle = initial
             self.isFirstFrame = true
             self.isSettling = false
             self.hasFiredFirstFrame = false
+            self.introStartTime = CACurrentMediaTime()
+            cancelRipple()
+        }
+
+        func triggerRipple(onCompleted: (() -> Void)? = nil) {
+            guard isRippleEnabled else {
+                onCompleted?()
+                return
+            }
+            isRippling = true
+            rippleStartTime = CACurrentMediaTime()
+            onRippleCompleted = onCompleted
+        }
+
+        func cancelRipple() {
+            isRippling = false
+            rippleStartTime = 0.0
+            onRippleCompleted = nil
         }
         private var hasFiredFirstFrame = false
 
@@ -144,8 +186,12 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             var maxBlur: Float
             var maxDarken: Float
             var aspect: Float
+            var transitionBlur: Float
             var pad0: Float = 0.0
+            var rippleProgress: Float = -1.0
+            var rippleIntensity: Float = 1.0
             var pad1: Float = 0.0
+            var pad2: Float = 0.0
         }
 
         override init() {
@@ -165,6 +211,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
 
         func cancelSettling() {
             isSettling = false
+            cancelRipple()
         }
 
         func updateParameters(
@@ -242,9 +289,22 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             guard let commandBuffer = commandQueue?.makeCommandBuffer(),
                   let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else { return }
 
+            let now = CACurrentMediaTime()
+
+            var transitionBlur: Float = 0.0
+            if isTransitionBlurEnabled && introStartTime > 0.0 {
+                let elapsed = now - introStartTime
+                let t = min(max(Float(elapsed / introDuration), 0.0), 1.0)
+                let factor = 1.0 - t
+                transitionBlur = factor * factor
+                if t >= 1.0 {
+                    introStartTime = 0.0
+                    transitionBlur = 0.0
+                }
+            }
+
             var settleFactor: Float = 0.0
             if isSettling {
-                let now = CACurrentMediaTime()
                 let elapsed = now - settleStartTime
                 let t = min(max(Float(elapsed / settleDuration), 0.0), 1.0)
                 settleFactor = 1.0 - pow(1.0 - t, 3.0)
@@ -252,8 +312,32 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                 if t >= 1.0 {
                     isSettling = false
                     settleFactor = 1.0
-                    DispatchQueue.main.async { [weak self] in
-                        self?.onSettleCompleted?()
+                    if isRippleEnabled && !isRippling {
+                        triggerRipple { [weak self] in
+                            self?.onSettleCompleted?()
+                        }
+                    } else {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.onSettleCompleted?()
+                        }
+                    }
+                }
+            } else if isRippling {
+                settleFactor = 1.0
+            }
+
+            var currentRippleProgress: Float = -1.0
+            if isRippling {
+                let elapsed = now - rippleStartTime
+                let t = min(max(Float(elapsed / rippleDuration), 0.0), 1.0)
+                currentRippleProgress = t
+                if t >= 1.0 {
+                    isRippling = false
+                    currentRippleProgress = -1.0
+                    let completion = onRippleCompleted
+                    onRippleCompleted = nil
+                    DispatchQueue.main.async {
+                        completion?()
                     }
                 }
             }
@@ -269,7 +353,11 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
 
             if isFirstFrame {
                 isFirstFrame = false
-                self.smoothedAngle = targetAngle
+                if isTransitionBlurEnabled {
+                    self.smoothedAngle = 90.0
+                } else {
+                    self.smoothedAngle = targetAngle
+                }
             } else if isSettling {
                 self.smoothedAngle = frozenAngle
             } else {
@@ -287,7 +375,13 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                 maxZoomOut: self.maxZoomOut,
                 maxBlur: self.maxBlur,
                 maxDarken: self.maxDarken,
-                aspect: aspect
+                aspect: aspect,
+                transitionBlur: transitionBlur,
+                pad0: 0.0,
+                rippleProgress: currentRippleProgress,
+                rippleIntensity: self.rippleIntensity,
+                pad1: 0.0,
+                pad2: 0.0
             )
 
             encoder.setRenderPipelineState(pipelineState)

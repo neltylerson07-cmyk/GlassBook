@@ -81,16 +81,18 @@ final class ScreenCaptureManager: ObservableObject {
         return PreparedDisplayTexture(texture: sourceTexture, blurredTexture: target)
     }
 
+    private let freshnessDuration: CFTimeInterval = 2.5
+
     /// Synchronous zero-latency snapshot getter for instant presentation.
     func getImmediateSnapshots() -> MultiScreenSnapshots? {
-        guard let warm = warmSnapshots, warm.builtinSnapshot != nil else { return nil }
+        guard isFresh, let warm = warmSnapshots, warm.builtinSnapshot != nil else { return nil }
         return warm
     }
 
-    /// Checks if the cached snapshot is recently taken (within last 1.8 seconds).
+    /// Checks if the cached snapshot is recently taken (within last 2.5 seconds).
     var isFresh: Bool {
         guard warmSnapshots?.builtinSnapshot != nil else { return false }
-        return (CACurrentMediaTime() - lastCaptureTimestamp) < 1.8
+        return (CACurrentMediaTime() - lastCaptureTimestamp) < freshnessDuration
     }
 
     /// Starts a proactive background capture so snapshots are immediately available when the lid reaches 90°.
@@ -104,6 +106,7 @@ final class ScreenCaptureManager: ObservableObject {
         inFlightCaptureTask = Task { [weak self] in
             guard let self = self else { return MultiScreenSnapshots() }
             let snaps = await self.performCaptureAllScreens()
+            guard !Task.isCancelled else { return MultiScreenSnapshots() }
             if snaps.builtinSnapshot != nil {
                 self.warmSnapshots = snaps
                 self.lastCaptureTimestamp = CACurrentMediaTime()
@@ -128,10 +131,17 @@ final class ScreenCaptureManager: ObservableObject {
         return nil
     }
 
-    /// Discards in-flight capture task.
+    /// Discards in-flight capture task and clears cached snapshots.
     func cancelPrecapture() {
         inFlightCaptureTask?.cancel()
         inFlightCaptureTask = nil
+        invalidateSnapshots()
+    }
+
+    /// Invalidates and clears warm snapshots so stale images are never presented.
+    func invalidateSnapshots() {
+        warmSnapshots = nil
+        lastCaptureTimestamp = 0.0
     }
 
     /// Captures snapshots across all connected displays (uses warm snapshot if available, or awaits in-flight).

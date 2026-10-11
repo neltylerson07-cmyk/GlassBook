@@ -26,7 +26,7 @@ struct PerspectiveUniforms {
     float lowAngleCompensation; // Low-angle taper & stretch compensation intensity (0.0 to 2.0, default 1.00)
     float clockProgress;      // Smooth transition progress for clock mode & background dimming (0.0 to 1.0)
     float showClock;          // 1.0 if clock texture is active, 0.0 otherwise
-    float pad0;               // 16-byte alignment padding
+    float transitionBlur;     // Quick entrance blur factor (1.0 = blurred on entry, 0.0 = clear)
     // Head Tracking Extensions (16 bytes)
     float headX;              // Normalized head lateral offset (-1.0 to 1.0, 0.0 = center)
     float headY;              // Normalized head vertical offset (-1.0 to 1.0, 0.0 = center)
@@ -37,6 +37,11 @@ struct PerspectiveUniforms {
     float headElevationSensitivity;    // Vertical tilt sensitivity (0.0 to 2.5, default 1.0)
     float keyboardParallaxSensitivity; // Keyboard lateral reflection shear with headX (0.0 to 2.5, default 0.85)
     float keyboardPitchSensitivity;    // Keyboard tilt & reach foreshortening with headY (0.0 to 2.5, default 0.85)
+    // Physical Edge Ripple Animation Feedback (16 bytes)
+    float rippleProgress;              // 0.0 to 1.0 (or < 0.0 when inactive)
+    float rippleIntensity;             // Overall amplitude factor (default 1.0)
+    float pad0;
+    float pad1;
 };
 
 vertex RasterizerData vertex_main(uint vertexID [[vertex_id]]) {
@@ -548,6 +553,248 @@ static FrostedGrainResult sampleFrostedGlassGrain(float2 uv, float aspect) {
     return result;
 }
 
+// MARK: - Blurred Drop Shadow Synthesizer for Digital Clock & Widgets
+inline float sampleClockOccupancy(texture2d<float> tex, sampler smp, float2 uv) {
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+        return 0.0f;
+    }
+    float a = tex.sample(smp, uv).a;
+    // Widget cards have translucent background alpha (~0.36); text digits have alpha (~0.72 - 0.96).
+    // Smoothly map [0.015, 0.35] -> [0.0, 1.0] so that both widget cards and text digits
+    // register as full-strength casters of the drop shadow.
+    return smoothstep(0.015f, 0.35f, a);
+}
+
+static float sampleClockShadow(float2 clockUV,
+                               texture2d<float> clockTexture,
+                               sampler textureSampler,
+                               float tiltAmount,
+                               float headX) {
+    // Optical drop shadow direction: light is overhead and slightly in front.
+    // In perspective, as the screen tilts back, the shadow projects further down the screen plane.
+    float shadowOffsetY = mix(0.012f, 0.032f, tiltAmount);
+    // Subtle lateral parallax offset responding to head tracking position
+    float shadowOffsetX = -headX * 0.007f;
+    float2 shadowOffset = float2(shadowOffsetX, shadowOffsetY);
+
+    float2 centerUV = clockUV - shadowOffset;
+
+    // Quick bounds check with safety margin for the broad blur footprint
+    if (centerUV.x < -0.20f || centerUV.x > 1.20f || centerUV.y < -0.20f || centerUV.y > 1.20f) {
+        return 0.0f;
+    }
+
+    float2 texStep = float2(1.0f / max(float(clockTexture.get_width()), 1.0f),
+                            1.0f / max(float(clockTexture.get_height()), 1.0f));
+
+    // Multi-tier hierarchical blur kernel for a very blurred, rich ambient & drop shadow:
+    // Center tap + Ring 1 (Contact, r=14) + Ring 2 (Body, r=36) + Ring 3 (Diffuse, r=75)
+    // + Ring 4 (Ambient Penumbra, r=135) + Ring 5 (Ultra-wide Halo, r=210)
+    float centerVal = sampleClockOccupancy(clockTexture, textureSampler, centerUV);
+
+    // Ring 1: 4 orthogonal samples at r=14 texels (~7 pt)
+    const float2 ring1Offsets[4] = {
+        float2( 1.0000f,  0.0000f), float2(-1.0000f,  0.0000f),
+        float2( 0.0000f,  1.0000f), float2( 0.0000f, -1.0000f)
+    };
+    float r1Avg = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        r1Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring1Offsets[i] * (texStep * 14.0f));
+    }
+    r1Avg *= 0.25f;
+
+    // Ring 2: 6 hexagonal samples at r=36 texels (~18 pt)
+    const float2 ring2Offsets[6] = {
+        float2( 0.8660f,  0.5000f), float2(-0.8660f,  0.5000f),
+        float2( 0.0000f,  1.0000f), float2( 0.0000f, -1.0000f),
+        float2(-0.8660f, -0.5000f), float2( 0.8660f, -0.5000f)
+    };
+    float r2Avg = 0.0f;
+    for (int i = 0; i < 6; ++i) {
+        r2Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring2Offsets[i] * (texStep * 36.0f));
+    }
+    r2Avg *= (1.0f / 6.0f);
+
+    // Ring 3: 8 octagonal samples at r=75 texels (~37 pt)
+    const float2 ring3Offsets[8] = {
+        float2( 1.0000f,  0.0000f), float2(-1.0000f,  0.0000f),
+        float2( 0.0000f,  1.0000f), float2( 0.0000f, -1.0000f),
+        float2( 0.7071f,  0.7071f), float2(-0.7071f,  0.7071f),
+        float2( 0.7071f, -0.7071f), float2(-0.7071f, -0.7071f)
+    };
+    float r3Avg = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        r3Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring3Offsets[i] * (texStep * 75.0f));
+    }
+    r3Avg *= 0.125f;
+
+    // Ring 4: 8 interleaved samples at r=135 texels (~67 pt)
+    const float2 ring4Offsets[8] = {
+        float2( 0.9239f,  0.3827f), float2(-0.9239f,  0.3827f),
+        float2( 0.3827f,  0.9239f), float2(-0.3827f,  0.9239f),
+        float2( 0.9239f, -0.3827f), float2(-0.9239f, -0.3827f),
+        float2( 0.3827f, -0.9239f), float2(-0.3827f, -0.9239f)
+    };
+    float r4Avg = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        r4Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring4Offsets[i] * (texStep * 135.0f));
+    }
+    r4Avg *= 0.125f;
+
+    // Ring 5: 8 wide ambient halo samples at r=210 texels (~105 pt)
+    float2 ambientCenterUV = clockUV - shadowOffset * 0.45f;
+    const float2 ring5Offsets[8] = {
+        float2( 0.9808f,  0.1951f), float2(-0.9808f,  0.1951f),
+        float2( 0.1951f,  0.9808f), float2(-0.1951f,  0.9808f),
+        float2( 0.9808f, -0.1951f), float2(-0.9808f, -0.1951f),
+        float2( 0.1951f, -0.9808f), float2(-0.1951f, -0.9808f)
+    };
+    float r5Avg = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        r5Avg += sampleClockOccupancy(clockTexture, textureSampler, ambientCenterUV + ring5Offsets[i] * (texStep * 210.0f));
+    }
+    r5Avg *= 0.125f;
+
+    // Stratified shadow layers:
+    // 1. Contact shadow: anchors immediately adjacent to digits and card edges
+    float contactShadow = centerVal * 0.30f + r1Avg * 0.40f + r2Avg * 0.30f;
+    // 2. Diffuse body shadow: soft, natural optical penumbra
+    float diffuseShadow = r2Avg * 0.30f + r3Avg * 0.45f + r4Avg * 0.25f;
+    // 3. Ambient halo: very broad, soft dark atmospheric pillow behind clock/widgets
+    float ambientHalo = r3Avg * 0.20f + r4Avg * 0.45f + r5Avg * 0.35f;
+
+    // Smooth photographic curve without harsh step cutoffs:
+    float softShadow = 1.0f - exp(-(1.5f * ambientHalo + 2.2f * diffuseShadow + 1.8f * contactShadow));
+    return clamp(softShadow, 0.0f, 1.0f);
+}
+
+// MARK: - Physical Edge Ripple / Shockwave Synthesizer
+struct RippleSampleResult {
+    float2 warpedUV;
+    float2 offset;
+    float glint;
+    float shadow;
+};
+
+static RippleSampleResult evaluateEdgeRipple(float2 uv, float aspect, float progress, float intensity) {
+    RippleSampleResult res;
+    res.warpedUV = uv;
+    res.offset = float2(0.0f);
+    res.glint = 0.0f;
+    res.shadow = 0.0f;
+
+    if (progress < 0.0f || progress > 1.0f || intensity <= 0.001f) {
+        return res;
+    }
+
+    // 1. Aspect-corrected coordinates centered at (0.5 * aspect, 0.5)
+    float2 halfSize = float2(0.5f * aspect, 0.5f);
+    float2 p = float2(uv.x * aspect, uv.y);
+    float2 offsetFromCenter = p - halfSize;
+    float2 dAbs = abs(offsetFromCenter);
+
+    // Inward direction signs
+    float2 sgn = float2(offsetFromCenter.x > 0.0f ? -1.0f : 1.0f,
+                        offsetFromCenter.y > 0.0f ? -1.0f : 1.0f);
+
+    // Rounded screen corners (MacBook display geometry)
+    const float cornerRadius = 0.060f;
+    float2 q = dAbs - (halfSize - float2(cornerRadius));
+
+    float edgeDist = 0.0f;
+    float2 inwardDir = float2(0.0f);
+
+    if (q.x > 0.0f && q.y > 0.0f) {
+        // Corner region: Euclidean distance to rounded corner
+        float distToCorner = length(q);
+        edgeDist = cornerRadius - distToCorner;
+        float2 cornerNormal = sgn * (q / max(distToCorner, 0.0001f));
+        inwardDir = normalize(float2(cornerNormal.x / aspect, cornerNormal.y));
+    } else {
+        // Edge region: top, bottom, left, right perimeter
+        float distLeftRight = halfSize.x - dAbs.x;
+        float distTopBottom = halfSize.y - dAbs.y;
+
+        float diff = distLeftRight - distTopBottom;
+        float blend = smoothstep(-0.04f, 0.04f, diff);
+
+        edgeDist = min(distLeftRight, distTopBottom);
+
+        float2 dirLR = float2(sgn.x, 0.0f);
+        float2 dirTB = float2(0.0f, sgn.y);
+        inwardDir = normalize(mix(dirLR, dirTB, blend));
+    }
+
+    if (edgeDist < -0.01f) {
+        return res;
+    }
+
+    // 2. Wave Propagation Dynamics:
+    // Wavefront travels strictly along the perimeter edge (confined to outermost ~12% rim)
+    const float maxTravelDist = 0.12f;
+    float waveRadius = progress * maxTravelDist;
+    float deltaR = edgeDist - waveRadius;
+
+    // 3. Wave Packet Envelope (Dual-crest Gabor wavelet):
+    const float wavelength = 0.1f;
+    const float twoPi = 6.2831853f;
+    float phase = (deltaR / wavelength) * twoPi;
+
+    const float packetSpread = 0.024f;
+    float packet = exp(-(deltaR * deltaR) / (2.0f * packetSpread * packetSpread));
+
+    float waveSin = sin(phase) * packet;
+    float waveCos = cos(phase) * packet;
+
+    // 4. Temporal and Spatial Dissipation Envelope (Hugs the edge, zero center intrusion):
+    float onset = smoothstep(0.0f, 0.10f, progress);
+    float timeDecay = pow(max(1.0f - progress, 0.0f), 0.2f);
+    float edgeConfine = smoothstep(maxTravelDist * 1.05f, 0.010f, edgeDist);
+
+    float amplitude = onset * timeDecay * edgeConfine * intensity;
+
+    // Physical coordinate displacement vector (subtle optical glass micro-warp)
+    float displacementMagnitude = waveSin * amplitude * 0.01f;
+    float2 uvDisp = inwardDir * displacementMagnitude;
+
+    res.warpedUV = clamp(uv - uvDisp, 0.0f, 1.0f);
+    res.offset = uvDisp;
+
+    // 5. Specular Curvature Highlight & Shadow (Subtle glass edge glint):
+    float slopeVal = waveCos * amplitude;
+    res.glint = max(slopeVal, 0.0f) * 0.0f;
+    res.shadow = max(-slopeVal, 0.0f) * 0.0f;
+
+    return res;
+}
+
+static float4 sampleTextureWithRipple(texture2d<float> screenTexture,
+                                      sampler textureSampler,
+                                      float2 uv,
+                                      float aspect,
+                                      float rippleProgress,
+                                      float rippleIntensity) {
+    if (rippleProgress < 0.0f || rippleProgress > 1.0f || rippleIntensity <= 0.001f) {
+        return screenTexture.sample(textureSampler, uv);
+    }
+
+    RippleSampleResult r = evaluateEdgeRipple(uv, aspect, rippleProgress, rippleIntensity);
+
+    // Subtle chromatic dispersion through wave crests
+    float2 dispR = r.offset * 0.08f;
+    float2 dispB = -r.offset * 0.08f;
+
+    float rCol = screenTexture.sample(textureSampler, clamp(r.warpedUV + dispR, 0.0f, 1.0f)).r;
+    float gCol = screenTexture.sample(textureSampler, r.warpedUV).g;
+    float bCol = screenTexture.sample(textureSampler, clamp(r.warpedUV + dispB, 0.0f, 1.0f)).b;
+    float alpha = screenTexture.sample(textureSampler, r.warpedUV).a;
+
+    float3 col = float3(rCol, gCol, bCol);
+    col = col * (1.0f - r.shadow) + float3(r.glint);
+
+    return float4(col, alpha);
+}
+
 fragment float4 fragment_main(RasterizerData in [[stage_in]],
                               texture2d<float> screenTexture [[texture(0)]],
                               texture2d<float> blurredTexture [[texture(1)]],
@@ -567,7 +814,11 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
 
     // Upright at 90° or wider, or settled: render flat and completely sharp edge-to-edge
     if (delta <= 0.0001f || uniforms.settleProgress >= 0.999f) {
-        float4 base = screenTexture.sample(textureSampler, uv);
+        float4 base = sampleTextureWithRipple(screenTexture, textureSampler, uv, uniforms.aspect, uniforms.rippleProgress, uniforms.rippleIntensity);
+        if (uniforms.transitionBlur > 0.001f) {
+            float4 introBlurColor = blurredTexture.sample(textureSampler, uv);
+            base = mix(base, introBlurColor, uniforms.transitionBlur * 0.70f);
+        }
         if (uniforms.showCalibrator > 0.5f) {
             float4 calib = calibratorTexture.sample(textureSampler, uv);
             base.rgb = base.rgb * (1.0f - calib.a) + calib.rgb;
@@ -575,6 +826,12 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
         if (uniforms.showClock > 0.5f && uniforms.clockProgress > 0.001f) {
             float dimFactor = mix(1.0f, 0.52f, uniforms.clockProgress);
             base.rgb *= dimFactor;
+
+            // Very blurred drop & ambient shadow cast underneath the clock onto the screen surface
+            float shadowVal = sampleClockShadow(uv, clockTexture, textureSampler, 0.0f, 0.0f);
+            float shadowAmount = shadowVal * 0.85f * uniforms.clockProgress;
+            base.rgb *= (1.0f - shadowAmount);
+
             float4 clockPixel = clockTexture.sample(textureSampler, uv);
             if (clockPixel.a > 0.01f) {
                 float2 texStep = float2(1.0f / max(float(clockTexture.get_width()), 1.0f),
@@ -710,7 +967,7 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
 
     if (isInside) {
         // 4. Sample and Blend Content with Frosted Glass Optical Model
-        float4 sharpColor = screenTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f));
+        float4 sharpColor = sampleTextureWithRipple(screenTexture, textureSampler, clamp(finalUV, 0.0f, 1.0f), uniforms.aspect, uniforms.rippleProgress, uniforms.rippleIntensity);
 
         if (frostAmount > 0.001f) {
             // Chromatic dispersion through screen-space grain facets
@@ -726,6 +983,12 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
         } else {
             float4 blurredColor = blurredTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f));
             frameColor = mix(sharpColor, blurredColor, localBlur);
+        }
+
+        // Quick entrance blur transition between desktop and snapshot
+        if (uniforms.transitionBlur > 0.001f) {
+            float4 introBlurColor = blurredTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f));
+            frameColor = mix(frameColor, introBlurColor, uniforms.transitionBlur * 0.70f);
         }
 
         // 5. Progressive Depth Shadow (Delayed to <= 70°)
@@ -794,6 +1057,16 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
 
     // 10. Digital Perspective Liquid Glass Clock Overlay (Rendered in 3D perspective over the dimmed background)
     if (uniforms.showClock > 0.5f && uniforms.clockProgress > 0.001f) {
+        // 10a. Very blurred drop & ambient shadow cast underneath the clock onto the tilted screen
+        if (cleanPerspectiveUV.x >= -0.20f && cleanPerspectiveUV.x <= 1.20f &&
+            cleanPerspectiveUV.y >= -0.20f && cleanPerspectiveUV.y <= 1.20f) {
+            float headParallax = uniforms.headX * uniforms.headTrackingActive;
+            float shadowVal = sampleClockShadow(cleanPerspectiveUV, clockTexture, textureSampler, tiltAmount, headParallax);
+            float shadowAmount = shadowVal * 0.88f * uniforms.clockProgress;
+            frameColor.rgb *= (1.0f - shadowAmount);
+        }
+
+        // 10b. Liquid Glass Clock digits/widget in perspective
         if (cleanPerspectiveUV.x >= 0.0f && cleanPerspectiveUV.x <= 1.0f &&
             cleanPerspectiveUV.y >= 0.0f && cleanPerspectiveUV.y <= 1.0f) {
             float4 clockPixel = clockTexture.sample(textureSampler, cleanPerspectiveUV);
@@ -851,8 +1124,12 @@ struct ExternalDisplayUniforms {
     float maxBlur;          // Max blur factor (0.0 to 1.0)
     float maxDarken;        // Max darken factor (0.0 to 1.0)
     float aspect;           // Display aspect ratio
+    float transitionBlur;   // Quick entrance blur factor (1.0 = blurred on entry, 0.0 = clear)
     float pad0;
+    float rippleProgress;   // 0.0 to 1.0 (or < 0.0 when inactive)
+    float rippleIntensity;  // Intensity factor (default 1.0)
     float pad1;
+    float pad2;
 };
 
 fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
@@ -865,7 +1142,7 @@ fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
 
     // When fully settled, return clean original
     if (uniforms.settleProgress >= 0.999f) {
-        return screenTexture.sample(textureSampler, uv);
+        return sampleTextureWithRipple(screenTexture, textureSampler, uv, uniforms.aspect, uniforms.rippleProgress, uniforms.rippleIntensity);
     }
 
     // Blend target angle toward upright 90° when settling
@@ -874,7 +1151,12 @@ fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
     float delta = uprightRad - currentTheta;
 
     if (delta <= 0.0001f) {
-        return screenTexture.sample(textureSampler, uv);
+        float4 base = sampleTextureWithRipple(screenTexture, textureSampler, uv, uniforms.aspect, uniforms.rippleProgress, uniforms.rippleIntensity);
+        if (uniforms.transitionBlur > 0.001f) {
+            float4 blurCol = blurredTexture.sample(textureSampler, uv);
+            base = mix(base, blurCol, uniforms.transitionBlur * 0.70f);
+        }
+        return base;
     }
 
     // Normalized progress: 0.0 at 90°, 1.0 at 15°
@@ -920,6 +1202,11 @@ fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
     float4 sharpCol = screenTexture.sample(textureSampler, sampleUV);
     float4 blurCol = blurredTexture.sample(textureSampler, sampleUV);
     float4 col = mix(sharpCol, blurCol, blurFactor);
+
+    // Quick entrance blur transition between desktop and snapshot
+    if (uniforms.transitionBlur > 0.001f) {
+        col = mix(col, blurCol, uniforms.transitionBlur * 0.70f);
+    }
 
     // 3. Progressive Darkening & Vignette
     float darkenFactor = clamp(activeProgress * uniforms.maxDarken, 0.0f, 0.85f);

@@ -34,6 +34,11 @@ struct PerspectiveMetalView: NSViewRepresentable {
     var blurIntensity: Float = 1.00
     var shadowIntensity: Float = 1.00
     var isSettling: Bool = false
+    var isTransitionBlurEnabled: Bool = true
+    var isRippleEnabled: Bool = true
+    var rippleIntensity: Float = 1.00
+    var isRippling: Bool = false
+    var onRippleCompleted: (() -> Void)? = nil
     var onSettleCompleted: (() -> Void)? = nil
     var onFirstFrame: (() -> Void)? = nil
 
@@ -71,9 +76,13 @@ struct PerspectiveMetalView: NSViewRepresentable {
         }
 
         context.coordinator.onFirstFrame = onFirstFrame
+        context.coordinator.isTransitionBlurEnabled = isTransitionBlurEnabled
+        context.coordinator.isRippleEnabled = isRippleEnabled
+        context.coordinator.rippleIntensity = rippleIntensity
         context.coordinator.sensor = sensor
         context.coordinator.lookahead = lookahead
         context.coordinator.onSettleCompleted = onSettleCompleted
+        context.coordinator.onRippleCompleted = onRippleCompleted
         context.coordinator.showCalibrator = showCalibrator
         context.coordinator.isClockActive = isClockActive
         context.coordinator.headTracker = headTracker
@@ -86,6 +95,12 @@ struct PerspectiveMetalView: NSViewRepresentable {
             context.coordinator.startSettling()
         } else if !isSettling && context.coordinator.isSettling {
             context.coordinator.cancelSettling()
+        }
+
+        if isRippling && !context.coordinator.isRippling {
+            context.coordinator.triggerRipple(onCompleted: onRippleCompleted)
+        } else if !isRippling && context.coordinator.isRippling {
+            context.coordinator.cancelRipple()
         }
 
         context.coordinator.updateParameters(
@@ -120,14 +135,41 @@ struct PerspectiveMetalView: NSViewRepresentable {
         var sensor: LidSensor?
         var lookahead: Double = 0.4
         var activationCount: Int = -1
+        var isTransitionBlurEnabled: Bool = true
+        var isRippleEnabled: Bool = true
+        var rippleIntensity: Float = 1.00
+        private(set) var isRippling: Bool = false
+        private var rippleStartTime: CFTimeInterval = 0.0
+        private let rippleDuration: CFTimeInterval = 0.40
+        var onRippleCompleted: (() -> Void)? = nil
+        private var introStartTime: CFTimeInterval = 0.0
+        private let introDuration: CFTimeInterval = 0.20
 
         func reset(angle: Double) {
             let initial = min(angle, 90.0)
-            self.smoothedAngle = initial
+            self.smoothedAngle = 90.0
             self.targetAngle = initial
             self.isFirstFrame = true
             self.isSettling = false
             self.hasFiredFirstFrame = false
+            self.introStartTime = CACurrentMediaTime()
+            cancelRipple()
+        }
+
+        func triggerRipple(onCompleted: (() -> Void)? = nil) {
+            guard isRippleEnabled else {
+                onCompleted?()
+                return
+            }
+            isRippling = true
+            rippleStartTime = CACurrentMediaTime()
+            onRippleCompleted = onCompleted
+        }
+
+        func cancelRipple() {
+            isRippling = false
+            rippleStartTime = 0.0
+            onRippleCompleted = nil
         }
         private var hasFiredFirstFrame = false
 
@@ -246,7 +288,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
             var lowAngleCompensation: Float
             var clockProgress: Float
             var showClock: Float
-            var pad0: Float = 0.0
+            var transitionBlur: Float
             var headX: Float
             var headY: Float
             var headZ: Float
@@ -255,6 +297,10 @@ struct PerspectiveMetalView: NSViewRepresentable {
             var headElevationSensitivity: Float
             var keyboardParallaxSensitivity: Float
             var keyboardPitchSensitivity: Float
+            var rippleProgress: Float
+            var rippleIntensity: Float
+            var pad0: Float = 0.0
+            var pad1: Float = 0.0
         }
 
         override init() {
@@ -437,9 +483,22 @@ struct PerspectiveMetalView: NSViewRepresentable {
             guard let commandBuffer = commandQueue?.makeCommandBuffer(),
                   let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else { return }
 
+            let now = CACurrentMediaTime()
+
+            var transitionBlur: Float = 0.0
+            if isTransitionBlurEnabled && introStartTime > 0.0 {
+                let elapsed = now - introStartTime
+                let t = min(max(Float(elapsed / introDuration), 0.0), 1.0)
+                let factor = 1.0 - t
+                transitionBlur = factor * factor
+                if t >= 1.0 {
+                    introStartTime = 0.0
+                    transitionBlur = 0.0
+                }
+            }
+
             var settleFactor: Float = 0.0
             if isSettling {
-                let now = CACurrentMediaTime()
                 let elapsed = now - settleStartTime
                 let t = min(max(Float(elapsed / settleDuration), 0.0), 1.0)
                 // Smooth cubic ease-out: 1 - (1 - t)^3
@@ -448,8 +507,34 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 if t >= 1.0 {
                     isSettling = false
                     settleFactor = 1.0
-                    DispatchQueue.main.async { [weak self] in
-                        self?.onSettleCompleted?()
+                    // Settle unwarp complete: trigger edge ripple visual feedback
+                    if isRippleEnabled && !isRippling {
+                        triggerRipple { [weak self] in
+                            self?.onSettleCompleted?()
+                        }
+                    } else {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.onSettleCompleted?()
+                        }
+                    }
+                }
+            } else if isRippling {
+                // Keep settled flat at 1.0 during post-settle or 90° ripple animation
+                settleFactor = 1.0
+            }
+
+            var currentRippleProgress: Float = -1.0
+            if isRippling {
+                let elapsed = now - rippleStartTime
+                let t = min(max(Float(elapsed / rippleDuration), 0.0), 1.0)
+                currentRippleProgress = t
+                if t >= 1.0 {
+                    isRippling = false
+                    currentRippleProgress = -1.0
+                    let completion = onRippleCompleted
+                    onRippleCompleted = nil
+                    DispatchQueue.main.async {
+                        completion?()
                     }
                 }
             }
@@ -465,17 +550,20 @@ struct PerspectiveMetalView: NSViewRepresentable {
 
             if isFirstFrame {
                 isFirstFrame = false
-                self.smoothedAngle = targetAngle
+                if isTransitionBlurEnabled {
+                    self.smoothedAngle = 90.0
+                } else {
+                    self.smoothedAngle = targetAngle
+                }
             } else if isSettling {
                 self.smoothedAngle = frozenAngle
             } else {
                 let speed = abs(sensor?.latestVelocity ?? 0.0)
-                let smoothingFactor = min(max(0.15 + speed * 0.005, 0.25), 0.2)
+                let smoothingFactor = min(max(0.18 + speed * 0.005, 0.22), 0.35)
                 self.smoothedAngle += (targetAngle - self.smoothedAngle) * smoothingFactor
             }
             
             // Clock transition progress animation
-            let now = CACurrentMediaTime()
             let dt = lastFrameTime > 0 ? Float(min(now - lastFrameTime, 0.1)) : 0.016
             lastFrameTime = now
 
@@ -514,7 +602,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 lowAngleCompensation: self.lowAngleCompensation,
                 clockProgress: self.clockProgress,
                 showClock: (self.clockTexture != nil && self.clockProgress > 0.001) ? 1.0 : 0.0,
-                pad0: 0.0,
+                transitionBlur: transitionBlur,
                 headX: head.x,
                 headY: head.y,
                 headZ: head.z,
@@ -522,7 +610,11 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 headParallaxSensitivity: self.headParallaxSensitivity,
                 headElevationSensitivity: self.headElevationSensitivity,
                 keyboardParallaxSensitivity: self.keyboardParallaxSensitivity,
-                keyboardPitchSensitivity: self.keyboardPitchSensitivity
+                keyboardPitchSensitivity: self.keyboardPitchSensitivity,
+                rippleProgress: currentRippleProgress,
+                rippleIntensity: self.rippleIntensity,
+                pad0: 0.0,
+                pad1: 0.0
             )
 
             encoder.setRenderPipelineState(pipelineState)

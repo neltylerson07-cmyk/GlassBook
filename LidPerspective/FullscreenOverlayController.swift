@@ -113,9 +113,9 @@ final class FullscreenOverlayController: ObservableObject {
             defer: false
         )
         newWindow.setFrame(screen.frame, display: false)
-        newWindow.alphaValue = 1.0
-        newWindow.isOpaque = true
-        newWindow.backgroundColor = .black
+        newWindow.alphaValue = 0.0
+        newWindow.isOpaque = false
+        newWindow.backgroundColor = .clear
         newWindow.hasShadow = false
 
         newWindow.onEscape = { [weak self] in
@@ -174,6 +174,9 @@ final class FullscreenOverlayController: ObservableObject {
             if self.viewState.showCalibrator {
                 self.viewState.requestRender()
             }
+        }
+        newWindow.onTriggerRipple = { [weak self] in
+            self?.triggerRippleFeedback()
         }
 
         newWindow.level = NSWindow.Level(Int(CGWindowLevelForKey(.screenSaverWindow)))
@@ -246,8 +249,20 @@ final class FullscreenOverlayController: ObservableObject {
 
             if let overlayWindow = builtinWindow {
                 overlayWindow.setFrame(screen.frame, display: true)
-                overlayWindow.alphaValue = 1.0
-                overlayWindow.makeKeyAndOrderFront(nil)
+                if viewState.isTransitionBlurEnabled {
+                    overlayWindow.isOpaque = false
+                    overlayWindow.backgroundColor = .clear
+                    overlayWindow.alphaValue = 0.0
+                    overlayWindow.makeKeyAndOrderFront(nil)
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = 0.14
+                        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                        overlayWindow.animator().alphaValue = 1.0
+                    }
+                } else {
+                    overlayWindow.alphaValue = 1.0
+                    overlayWindow.makeKeyAndOrderFront(nil)
+                }
             }
         }
 
@@ -264,10 +279,16 @@ final class FullscreenOverlayController: ObservableObject {
                     defer: false
                 )
                 extWindow.setFrame(ext.screen.frame, display: true)
-                extWindow.alphaValue = 1.0
-                extWindow.isOpaque = true
-                extWindow.backgroundColor = .black
                 extWindow.hasShadow = false
+                if viewState.isTransitionBlurEnabled {
+                    extWindow.alphaValue = 0.0
+                    extWindow.isOpaque = false
+                    extWindow.backgroundColor = .clear
+                } else {
+                    extWindow.alphaValue = 1.0
+                    extWindow.isOpaque = true
+                    extWindow.backgroundColor = .black
+                }
 
                 extWindow.onEscape = { [weak self] in
                     self?.dismiss()
@@ -300,7 +321,16 @@ final class FullscreenOverlayController: ObservableObject {
                 )
 
                 extWindow.contentView = extHostView
-                extWindow.orderFront(nil)
+                if viewState.isTransitionBlurEnabled {
+                    extWindow.orderFront(nil)
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = 0.14
+                        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                        extWindow.animator().alphaValue = 1.0
+                    }
+                } else {
+                    extWindow.orderFront(nil)
+                }
                 self.externalWindows.append(extWindow)
             }
             self.isExternalShowing = !self.externalWindows.isEmpty
@@ -399,7 +429,7 @@ final class FullscreenOverlayController: ObservableObject {
             activeWindow.animator().alphaValue = 0.0
         }, completionHandler: {
             activeWindow.orderOut(nil)
-            activeWindow.alphaValue = 1.0
+            activeWindow.alphaValue = 0.0
             DispatchQueue.main.async {
                 if self.externalWindows.isEmpty {
                     handler?()
@@ -420,9 +450,49 @@ final class FullscreenOverlayController: ObservableObject {
             viewState.isSettling = false
             viewState.onSettleCompleted = nil
         }
+        if viewState.isRippling {
+            viewState.cancelRipple()
+        }
         if isExternalSettling {
             isExternalSettling = false
             onExternalSettleCompleted = nil
+        }
+    }
+
+    /// Triggers the ripple animation feedback explicitly without dismissing.
+    func triggerRippleFeedback(completion: (() -> Void)? = nil) {
+        guard isShowing else {
+            completion?()
+            return
+        }
+        viewState.triggerRipple(onCompleted: completion)
+    }
+
+    /// Triggers 90-degree visual feedback (perimeter edge ripple) and smoothly dismisses when completed.
+    func trigger90DegreeRippleDismiss(completion: (() -> Void)? = nil) {
+        guard isShowing, !viewState.isRippling else {
+            completion?()
+            return
+        }
+        if viewState.isSettling {
+            let prevHandler = viewState.onSettleCompleted
+            viewState.onSettleCompleted = { [weak self] in
+                prevHandler?()
+                completion?()
+            }
+            return
+        }
+
+        viewState.triggerRipple { [weak self] in
+            guard let self = self else {
+                completion?()
+                return
+            }
+            if self.builtinWindow != nil {
+                self.fadeAndDismissBuiltin(completion: completion)
+            } else {
+                self.dismiss(completion: completion)
+            }
         }
     }
 
@@ -463,10 +533,10 @@ final class FullscreenOverlayController: ObservableObject {
             }
         }, completionHandler: {
             activeBuiltin?.orderOut(nil)
-            activeBuiltin?.alphaValue = 1.0
+            activeBuiltin?.alphaValue = 0.0
             for extWindow in activeExternals {
                 extWindow.orderOut(nil)
-                extWindow.alphaValue = 1.0
+                extWindow.alphaValue = 0.0
             }
             DispatchQueue.main.async {
                 handler?()
@@ -688,6 +758,13 @@ final class OverlayViewState: ObservableObject {
     @Published var lookaheadTime: Double = 0.28
     @Published var activationCount: Int = 0
     @Published var isKeyboardReflectionEnabled: Bool = true
+    @Published var isTransitionBlurEnabled: Bool = {
+        UserDefaults.standard.object(forKey: "isTransitionBlurEnabled") as? Bool ?? true
+    }() {
+        didSet {
+            UserDefaults.standard.set(isTransitionBlurEnabled, forKey: "isTransitionBlurEnabled")
+        }
+    }
     @Published var keyboardReflection: Float = 0.44
     @Published var isFrostedGlassEnabled: Bool = true
     @Published var frostedGlass: Float = 0.10
@@ -722,6 +799,33 @@ final class OverlayViewState: ObservableObject {
     // Settle animation state
     @Published var isSettling: Bool = false
     var onSettleCompleted: (() -> Void)?
+
+    // Edge Ripple visual feedback state
+    @Published var isRippleEnabled: Bool = {
+        UserDefaults.standard.object(forKey: "isRippleEnabled") as? Bool ?? true
+    }() {
+        didSet {
+            UserDefaults.standard.set(isRippleEnabled, forKey: "isRippleEnabled")
+        }
+    }
+    @Published var rippleIntensity: Float = 1.00
+    @Published var isRippling: Bool = false
+    var onRippleCompleted: (() -> Void)?
+
+    func triggerRipple(onCompleted: (() -> Void)? = nil) {
+        guard isRippleEnabled else {
+            onCompleted?()
+            return
+        }
+        isRippling = true
+        onRippleCompleted = onCompleted
+        requestRender()
+    }
+
+    func cancelRipple() {
+        isRippling = false
+        onRippleCompleted = nil
+    }
 
     func nextSetting() {
         let list = TunableSetting.allDisplayedSettings
@@ -1204,7 +1308,6 @@ struct StandByCalendarClockView: View {
                 RoundedRectangle(cornerRadius: max(24, 34 * sizeMultiplier), style: .continuous)
                     .strokeBorder(Color.white.opacity(0.18), lineWidth: 1.2)
             )
-            .shadow(color: Color.black.opacity(0.40), radius: 24, x: 0, y: 10)
 
             // RIGHT WIDGET: Squircle Analog Clock
             ZStack {
@@ -1215,7 +1318,6 @@ struct StandByCalendarClockView: View {
                         RoundedRectangle(cornerRadius: max(24, 34 * sizeMultiplier), style: .continuous)
                             .strokeBorder(Color.white.opacity(0.18), lineWidth: 1.2)
                     )
-                    .shadow(color: Color.black.opacity(0.40), radius: 24, x: 0, y: 10)
 
                 // Perimeter Minute and Hour Hash Marks
                 let halfW = rightCardSize / 2
@@ -1363,7 +1465,6 @@ struct PerspectiveClockView: View {
                     Text(dateString)
                         .font(.system(size: dateFontSize, weight: .semibold, design: .default))
                         .foregroundStyle(Color.white.opacity(0.96))
-                        .shadow(color: Color.black.opacity(0.45), radius: 8, x: 0, y: 2)
 
                     // Hero Digital Clock — Apple Lock Screen Liquid Glass
                     Text(timeString)
@@ -1380,8 +1481,6 @@ struct PerspectiveClockView: View {
                                 endPoint: .bottom
                             )
                         )
-                        .shadow(color: Color.black.opacity(0.42), radius: 18, x: 0, y: 8)
-                        .shadow(color: Color.black.opacity(0.25), radius: 4, x: 0, y: 2)
                 }
                 .padding(.horizontal, horizontalPadding)
                 .padding(.vertical, verticalPadding)
@@ -1404,6 +1503,7 @@ private class KeyCatchingWindow: NSWindow {
     var onArrowLeft: (() -> Void)?
     var onArrowRight: (() -> Void)?
     var onReset: (() -> Void)?
+    var onTriggerRipple: (() -> Void)?
     var onMouseDown: (() -> Void)?
     var onActivity: (() -> Void)?
 
@@ -1444,6 +1544,8 @@ private class KeyCatchingWindow: NSWindow {
             onToggleHeadMode?()
         case 15: // 'R' key
             onReset?()
+        case 13: // 'W' key (Wave / Ripple feedback)
+            onTriggerRipple?()
         default:
             let char = event.charactersIgnoringModifiers?.lowercased()
             if char == "c" {
@@ -1458,6 +1560,8 @@ private class KeyCatchingWindow: NSWindow {
                 onToggleFrostedGlass?()
             } else if char == "h" {
                 onToggleHUD?()
+            } else if char == "w" || char == "p" {
+                onTriggerRipple?()
             } else {
                 super.keyDown(with: event)
             }
@@ -1507,6 +1611,13 @@ private struct FullscreenPerspectiveContainer: View {
                 blurIntensity: state.blurIntensity,
                 shadowIntensity: state.shadowIntensity,
                 isSettling: state.isSettling,
+                isTransitionBlurEnabled: state.isTransitionBlurEnabled,
+                isRippleEnabled: state.isRippleEnabled,
+                rippleIntensity: state.rippleIntensity,
+                isRippling: state.isRippling,
+                onRippleCompleted: {
+                    state.onRippleCompleted?()
+                },
                 onSettleCompleted: {
                     state.onSettleCompleted?()
                 },
@@ -1579,6 +1690,13 @@ private struct ExternalMonitorContainer: View {
             maxBlur: controller.externalBlur,
             maxDarken: controller.externalDarken,
             isSettling: controller.isExternalSettling,
+            isTransitionBlurEnabled: controller.viewState.isTransitionBlurEnabled,
+            isRippleEnabled: controller.viewState.isRippleEnabled,
+            rippleIntensity: controller.viewState.rippleIntensity,
+            isRippling: controller.viewState.isRippling,
+            onRippleCompleted: {
+                controller.viewState.onRippleCompleted?()
+            },
             onSettleCompleted: {
                 controller.onExternalSettleCompleted?()
             },
