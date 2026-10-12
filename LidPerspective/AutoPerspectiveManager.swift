@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import Combine
 
+
 @MainActor
 final class AutoPerspectiveManager: ObservableObject {
     @Published var isAutoModeEnabled: Bool = true {
@@ -93,6 +94,7 @@ final class AutoPerspectiveManager: ObservableObject {
         }
     }
 
+
     @Published var isArmed: Bool = false
     @Published var isCapturing: Bool = false
     @Published var statusDescription: String = "Initializing..."
@@ -149,34 +151,16 @@ final class AutoPerspectiveManager: ObservableObject {
         // If overlay is currently displayed on any screen
         if overlayController.isShowing {
             if angle >= closeThreshold {
-                // Lid opened to 90° or wider: provide edge ripple feedback that animation is over / at 90°
-                if angle >= rearmThreshold + 8.0 {
-                    // Lid opened far past upright (>100°): cancel settle and dismiss immediately
-                    cancelAllDwellTimers()
-                    overlayController.deactivateClockMode()
-                    overlayController.cancelSettling()
-                    overlayController.dismiss()
-                    captureManager.cancelPrecapture()
-                    isArmed = true
-                    lastSettledAngle = nil
-                    statusDescription = "Armed — Close lid (<90°) to activate"
-                    return
-                }
-
-                if !overlayController.viewState.isRippling && !overlayController.viewState.isSettling {
-                    cancelAllDwellTimers()
-                    overlayController.deactivateClockMode()
-                    statusDescription = "At 90.0° — Settling complete"
-                    self.lastDismissalTime = CACurrentMediaTime()
-                    overlayController.trigger90DegreeRippleDismiss { [weak self] in
-                        guard let self = self else { return }
-                        self.lastDismissalTime = CACurrentMediaTime()
-                        self.captureManager.cancelPrecapture()
-                        self.isArmed = false
-                        self.lastSettledAngle = nil
-                        self.statusDescription = "Open lid past 92° to re-arm"
-                    }
-                }
+                // Lid opened to 90° or wider: dismiss overlay and re-arm
+                cancelAllDwellTimers()
+                overlayController.deactivateClockMode()
+                overlayController.cancelSettling()
+                overlayController.dismiss()
+                captureManager.cancelPrecapture()
+                isArmed = true
+                lastSettledAngle = nil
+                lastDismissalTime = CACurrentMediaTime()
+                statusDescription = "Armed — Close lid (<90°) to activate"
                 return
             }
 
@@ -201,9 +185,10 @@ final class AutoPerspectiveManager: ObservableObject {
                     overlayController.deactivateClockMode()
                 }
 
-                // If user resumes moving while settling or rippling, cancel and resume perspective animations
-                if overlayController.isSettling || overlayController.isExternalSettling || overlayController.viewState.isRippling {
+                // If user resumes moving while settling, cancel immediately and resume live 3D perspective!
+                if overlayController.isSettling || overlayController.isExternalSettling {
                     overlayController.cancelSettling()
+                    lastSettledAngle = nil
                 }
 
                 // Restart external dwell timer if external overlay is still showing
@@ -243,7 +228,7 @@ final class AutoPerspectiveManager: ObservableObject {
         // Overlay is not showing. Avoid capturing if already capturing.
         guard !isCapturing else { return }
 
-        if angle >= rearmThreshold {
+        if angle >= closeThreshold {
             if !isArmed {
                 isArmed = true
             }
@@ -265,6 +250,9 @@ final class AutoPerspectiveManager: ObservableObject {
                 captureManager.cancelPrecapture()
             }
         } else if angle < closeThreshold && angle >= minUsableAngle {
+            let now = CACurrentMediaTime()
+            let timeSinceDismissal = now - lastDismissalTime
+
             if isArmed {
                 isArmed = false
                 lastSettledAngle = nil
@@ -273,11 +261,14 @@ final class AutoPerspectiveManager: ObservableObject {
                 // Screen was settled at a low angle. Check if user deliberately adjusts the lid again!
                 let velocity = abs(sensor.latestVelocity)
                 let angleDelta = abs(angle - settledAngle)
-                if (velocity > 2.0 && angleDelta > 1.2) || angleDelta > 3.0 {
-                    // Deliberate lid adjustment detected! Reactivate perspective mode
+                if timeSinceDismissal > 0.4 && ((velocity > 1.2 && angleDelta > 0.8) || angleDelta > 2.0) {
                     lastSettledAngle = nil
                     triggerPerspective()
                 }
+            } else if timeSinceDismissal > 0.3 {
+                // Deliberate movement below 90° when not settled: reactivate perspective immediately
+                lastSettledAngle = nil
+                triggerPerspective()
             }
         }
     }
@@ -387,11 +378,9 @@ final class AutoPerspectiveManager: ObservableObject {
             return
         }
 
-        // Debounce: prevent re-triggering during or immediately after dismissal cooldown
-        guard CACurrentMediaTime() - lastDismissalTime > 0.8 else { return }
-
         cancelAllDwellTimers()
         dwellReferenceAngle = sensor.displayAngle
+        sensor.resetPrediction()
 
         if HeadTracker.shared.mode == .snapshotOnClose {
             HeadTracker.shared.captureFaceSnapshot()
@@ -445,6 +434,9 @@ final class AutoPerspectiveManager: ObservableObject {
                 self.statusDescription = "Perspective active"
             } else {
                 self.statusDescription = "Screen capture failed"
+                if self.sensor.displayAngle < self.closeThreshold && self.sensor.displayAngle >= self.minUsableAngle {
+                    self.isArmed = true
+                }
             }
             self.isCapturing = false
         }
@@ -455,11 +447,12 @@ final class AutoPerspectiveManager: ObservableObject {
         cancelAllDwellTimers()
         overlayController.deactivateClockMode()
         captureManager.invalidateSnapshots()
+        sensor.resetPrediction()
         if sensor.displayAngle < closeThreshold && sensor.displayAngle >= minUsableAngle {
             isArmed = false
             lastSettledAngle = sensor.displayAngle
             statusDescription = String(format: "Screen ready (%.1f°) — Adjust lid to reactivate", sensor.displayAngle)
-        } else if sensor.displayAngle >= rearmThreshold {
+        } else if sensor.displayAngle >= closeThreshold {
             isArmed = true
             lastSettledAngle = nil
             statusDescription = "Armed — Close lid (<90°) to activate"

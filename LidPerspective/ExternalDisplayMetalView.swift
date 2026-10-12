@@ -16,10 +16,6 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
     var maxDarken: Float = 0.40
     var isSettling: Bool = false
     var isTransitionBlurEnabled: Bool = true
-    var isRippleEnabled: Bool = true
-    var rippleIntensity: Float = 1.00
-    var isRippling: Bool = false
-    var onRippleCompleted: (() -> Void)? = nil
     var onSettleCompleted: (() -> Void)? = nil
     var onFirstFrame: (() -> Void)? = nil
 
@@ -29,6 +25,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         mtkView.colorPixelFormat = .bgra8Unorm
+        mtkView.layer?.isOpaque = false
         mtkView.framebufferOnly = true
 
         if let colorSpace = snapshot?.colorSpace ?? NSScreen.main?.colorSpace?.cgColorSpace ?? CGColorSpace(name: CGColorSpace.displayP3) {
@@ -55,12 +52,9 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
 
         context.coordinator.onFirstFrame = onFirstFrame
         context.coordinator.isTransitionBlurEnabled = isTransitionBlurEnabled
-        context.coordinator.isRippleEnabled = isRippleEnabled
-        context.coordinator.rippleIntensity = rippleIntensity
         context.coordinator.sensor = sensor
         context.coordinator.lookahead = lookahead
         context.coordinator.onSettleCompleted = onSettleCompleted
-        context.coordinator.onRippleCompleted = onRippleCompleted
 
         if isSettling && !context.coordinator.isSettling && !context.coordinator.hasFinishedSettle {
             context.coordinator.startSettling()
@@ -68,9 +62,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             context.coordinator.cancelSettling()
         }
 
-        if isRippling && !context.coordinator.isRippling {
-            context.coordinator.triggerRipple(onCompleted: onRippleCompleted)
-        }
+
 
         context.coordinator.updateParameters(
             snapshot: snapshot,
@@ -93,12 +85,6 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         var lookahead: Double = 0.4
         var activationCount: Int = -1
         var isTransitionBlurEnabled: Bool = true
-        var isRippleEnabled: Bool = true
-        var rippleIntensity: Float = 1.00
-        private(set) var isRippling: Bool = false
-        private var rippleStartTime: CFTimeInterval = 0.0
-        private let rippleDuration: CFTimeInterval = 0.40
-        var onRippleCompleted: (() -> Void)? = nil
         private var introStartTime: CFTimeInterval = 0.0
         private let introDuration: CFTimeInterval = 0.20
         private(set) var hasFinishedSettle: Bool = false
@@ -112,24 +98,9 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             self.hasFinishedSettle = false
             self.hasFiredFirstFrame = false
             self.introStartTime = CACurrentMediaTime()
-            cancelRipple()
         }
 
-        func triggerRipple(onCompleted: (() -> Void)? = nil) {
-            guard isRippleEnabled else {
-                onCompleted?()
-                return
-            }
-            isRippling = true
-            rippleStartTime = CACurrentMediaTime()
-            onRippleCompleted = onCompleted
-        }
 
-        func cancelRipple() {
-            isRippling = false
-            rippleStartTime = 0.0
-            onRippleCompleted = nil
-        }
         private var hasFiredFirstFrame = false
 
         // Shared static GPU assets to eliminate main-thread recompilations
@@ -188,10 +159,6 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             var aspect: Float
             var transitionBlur: Float
             var pad0: Float = 0.0
-            var rippleProgress: Float = -1.0
-            var rippleIntensity: Float = 1.0
-            var pad1: Float = 0.0
-            var pad2: Float = 0.0
         }
 
         override init() {
@@ -214,7 +181,6 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
             isSettling = false
             hasFinishedSettle = false
             settleStartTime = 0.0
-            cancelRipple()
         }
 
         func updateParameters(
@@ -286,7 +252,8 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                   let texture = texture,
                   let blurredTexture = blurredTexture else { return }
 
-            renderPass.colorAttachments[0].loadAction = .dontCare
+            renderPass.colorAttachments[0].loadAction = .clear
+            renderPass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
             renderPass.colorAttachments[0].storeAction = .store
 
             guard let commandBuffer = commandQueue?.makeCommandBuffer(),
@@ -316,34 +283,12 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                     isSettling = false
                     hasFinishedSettle = true
                     settleFactor = 1.0
-                    if isRippleEnabled && !isRippling {
-                        triggerRipple { [weak self] in
-                            self?.onSettleCompleted?()
-                        }
-                    } else {
-                        DispatchQueue.main.async { [weak self] in
-                            self?.onSettleCompleted?()
-                        }
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onSettleCompleted?()
                     }
                 }
-            } else if isRippling || hasFinishedSettle {
+            } else if hasFinishedSettle {
                 settleFactor = 1.0
-            }
-
-            var currentRippleProgress: Float = -1.0
-            if isRippling {
-                let elapsed = now - rippleStartTime
-                let t = min(max(Float(elapsed / rippleDuration), 0.0), 1.0)
-                currentRippleProgress = t
-                if t >= 1.0 {
-                    isRippling = false
-                    currentRippleProgress = -1.0
-                    let completion = onRippleCompleted
-                    onRippleCompleted = nil
-                    DispatchQueue.main.async {
-                        completion?()
-                    }
-                }
             }
 
             let targetAngle: Double
@@ -381,11 +326,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                 maxDarken: self.maxDarken,
                 aspect: aspect,
                 transitionBlur: transitionBlur,
-                pad0: 0.0,
-                rippleProgress: currentRippleProgress,
-                rippleIntensity: self.rippleIntensity,
-                pad1: 0.0,
-                pad2: 0.0
+                pad0: 0.0
             )
 
             encoder.setRenderPipelineState(pipelineState)

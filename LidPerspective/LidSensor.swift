@@ -10,6 +10,7 @@ final class LidSensor: ObservableObject {
     private var _atomicAngle: Double = 90.0
     private var _atomicVelocity: Double = 0.0
     private var _atomicTimestamp: CFTimeInterval = 0.0
+    private var _atomicLeadDelta: Double = 0.0
     private let lock = os_unfair_lock_t.allocate(capacity: 1)
 
     // Sliding window of angle measurements for smooth velocity regression
@@ -30,36 +31,59 @@ final class LidSensor: ObservableObject {
         return val
     }
 
-    /// Extrapolates angle ahead in time based on smoothed angular velocity (dead-reckoning / lookahead)
+    func resetPrediction() {
+        os_unfair_lock_lock(lock)
+        _atomicLeadDelta = 0.0
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// Extrapolates angle ahead in time based on smoothed angular velocity (dead-reckoning / lookahead).
+    /// When the lid stops moving, the predicted angle stays rather than correcting itself back to the raw angle.
     func extrapolatedAngle(lookahead: Double) -> Double {
         os_unfair_lock_lock(lock)
         let angle = _atomicAngle
         let velocity = _atomicVelocity
-        let timestamp = _atomicTimestamp
-        os_unfair_lock_unlock(lock)
+        var currentLead = _atomicLeadDelta
 
-        let now = CACurrentMediaTime()
-        let elapsedSinceSample = max(0.0, now - timestamp)
-
-        // If no new readings arrived for > 150ms, velocity gracefully fades to zero
-        let decay = max(0.0, 1.0 - (elapsedSinceSample / 0.15))
-        let effectiveVelocity = velocity * decay
-
-        let totalForwardTime = elapsedSinceSample + lookahead
-        var forwardDelta = effectiveVelocity * totalForwardTime
-
-        // When lifting the lid up (effectiveVelocity > 0), make velocity stronger
-        // so the animation leads forward responsively and unwarps cleanly
-        if effectiveVelocity > 0 {
-            forwardDelta *= 1
+        // Reset lead offset when the lid is opened to 90° or wider
+        if angle >= 90.0 {
+            _atomicLeadDelta = 0.0
+            os_unfair_lock_unlock(lock)
+            return 90.0
         }
 
-        // Soft-clamp the maximum projection delta to prevent jarring overshoot
-        let maxLeadDegrees = effectiveVelocity > 0 ? 18.0 : 12.0
-        forwardDelta = min(max(forwardDelta, -maxLeadDegrees), maxLeadDegrees)
+        let forwardDelta = velocity * lookahead
 
-        let projected = angle + forwardDelta
-        return min(max(projected, 0.0), 180.0)
+        if velocity < -0.4 {
+            // Closing: project downward (clamped up to 12° lead)
+            let clampedLead = max(forwardDelta, -12.0)
+            if currentLead <= 0 {
+                // Latch to the furthest predicted angle reached while closing
+                currentLead = min(currentLead, clampedLead)
+            } else {
+                // Reversing from opening to closing: smoothly transition lead
+                currentLead += (clampedLead - currentLead) * 0.25
+            }
+            _atomicLeadDelta = currentLead
+        } else if velocity > 0.4 {
+            // Opening: project upward (clamped up to 18° lead)
+            let clampedLead = min(forwardDelta, 18.0)
+            if currentLead >= 0 {
+                // Latch to the furthest predicted angle reached while opening
+                currentLead = max(currentLead, clampedLead)
+            } else {
+                // Reversing from closing to opening: smoothly transition lead
+                currentLead += (clampedLead - currentLead) * 0.25
+            }
+            _atomicLeadDelta = currentLead
+        }
+        // When velocity is between -0.4 and 0.4 (lid stationary / stopped),
+        // currentLead is preserved so the predicted angle just stays!
+
+        os_unfair_lock_unlock(lock)
+
+        let projected = angle + currentLead
+        return min(max(projected, 0.0), 90.0)
     }
 
     // Published for UI text label and automatic angle tracking

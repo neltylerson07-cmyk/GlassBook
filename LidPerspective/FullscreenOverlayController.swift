@@ -175,9 +175,6 @@ final class FullscreenOverlayController: ObservableObject {
                 self.viewState.requestRender()
             }
         }
-        newWindow.onTriggerRipple = { [weak self] in
-            self?.triggerRippleFeedback()
-        }
 
         newWindow.level = NSWindow.Level(Int(CGWindowLevelForKey(.screenSaverWindow)))
         newWindow.collectionBehavior = [
@@ -232,9 +229,7 @@ final class FullscreenOverlayController: ObservableObject {
             // Reset settle state when showing fresh overlay
             viewState.activationCount += 1
             viewState.isSettling = false
-            viewState.isRippling = false
-            viewState.onSettleCompleted = nil
-            viewState.onRippleCompleted = nil
+                viewState.onSettleCompleted = nil
             viewState.showCalibrator = showCalibrator
             viewState.screenSize = screen.frame.size
             viewState.currentSnapshot = builtinSnapshot
@@ -250,6 +245,7 @@ final class FullscreenOverlayController: ObservableObject {
             prepareBuiltinWindow(sensor: sensor)
 
             if let overlayWindow = builtinWindow {
+                overlayWindow.ignoresMouseEvents = false
                 overlayWindow.setFrame(screen.frame, display: true)
                 if viewState.isTransitionBlurEnabled {
                     overlayWindow.isOpaque = false
@@ -338,7 +334,9 @@ final class FullscreenOverlayController: ObservableObject {
             self.isExternalShowing = !self.externalWindows.isEmpty
         }
 
-        self.isShowing = (builtinWindow != nil || !externalWindows.isEmpty)
+        let builtinShown = (snapshots.builtinSnapshot != nil && builtinWindow != nil)
+        let externalShown = !externalWindows.isEmpty
+        self.isShowing = (builtinShown || externalShown)
     }
 
     /// Convenience show method for single snapshot
@@ -411,22 +409,23 @@ final class FullscreenOverlayController: ObservableObject {
                 return
             }
             self.viewState.isSettling = false
-            self.viewState.isRippling = false
+
+            // Unwarp to 90° flat is complete!
+            self.builtinWindow?.ignoresMouseEvents = true
             self.fadeAndDismissBuiltin(completion: completion)
         }
     }
 
-    /// Smoothly fades out the built-in overlay window to reveal the live desktop underneath.
+    /// Smoothly dismisses the built-in overlay window to reveal the live desktop underneath.
     func fadeAndDismissBuiltin(completion: (() -> Void)? = nil) {
         headTracker.releaseTracking()
         viewState.isSettling = false
-        viewState.isRippling = false
         viewState.onSettleCompleted = nil
-        viewState.onRippleCompleted = nil
         guard let activeWindow = builtinWindow else {
             completion?()
             return
         }
+        activeWindow.ignoresMouseEvents = false
         if externalWindows.isEmpty {
             isShowing = false
         }
@@ -435,20 +434,15 @@ final class FullscreenOverlayController: ObservableObject {
             self.onDismissal = nil
         }
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.10
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            activeWindow.animator().alphaValue = 0.0
-        }, completionHandler: {
-            activeWindow.orderOut(nil)
-            activeWindow.alphaValue = 0.0
-            DispatchQueue.main.async {
-                if self.externalWindows.isEmpty {
-                    handler?()
-                }
-                completion?()
+        // Order out immediately:
+        activeWindow.orderOut(nil)
+        activeWindow.alphaValue = 0.0
+        DispatchQueue.main.async {
+            if self.externalWindows.isEmpty {
+                handler?()
             }
-        })
+            completion?()
+        }
     }
 
     /// Legacy / backward compatible method for fading and dismissing builtin
@@ -458,55 +452,21 @@ final class FullscreenOverlayController: ObservableObject {
 
     /// Cancels settling in progress if user resumes moving the lid.
     func cancelSettling() {
+        if let win = builtinWindow {
+            win.animator().alphaValue = 1.0
+            win.ignoresMouseEvents = false
+        }
+        for win in externalWindows {
+            win.animator().alphaValue = 1.0
+            win.ignoresMouseEvents = false
+        }
         if viewState.isSettling {
             viewState.isSettling = false
             viewState.onSettleCompleted = nil
         }
-        if viewState.isRippling {
-            viewState.cancelRipple()
-        }
         if isExternalSettling {
             isExternalSettling = false
             onExternalSettleCompleted = nil
-        }
-    }
-
-    /// Triggers the ripple animation feedback explicitly without dismissing.
-    func triggerRippleFeedback(completion: (() -> Void)? = nil) {
-        guard isShowing else {
-            completion?()
-            return
-        }
-        viewState.triggerRipple(onCompleted: completion)
-    }
-
-    /// Triggers 90-degree visual feedback (perimeter edge ripple) and smoothly dismisses when completed.
-    func trigger90DegreeRippleDismiss(completion: (() -> Void)? = nil) {
-        guard isShowing, !viewState.isRippling else {
-            completion?()
-            return
-        }
-        if viewState.isSettling {
-            let prevHandler = viewState.onSettleCompleted
-            viewState.onSettleCompleted = { [weak self] in
-                self?.viewState.isRippling = false
-                prevHandler?()
-                completion?()
-            }
-            return
-        }
-
-        viewState.triggerRipple { [weak self] in
-            guard let self = self else {
-                completion?()
-                return
-            }
-            self.viewState.isRippling = false
-            if self.builtinWindow != nil {
-                self.fadeAndDismissBuiltin(completion: completion)
-            } else {
-                self.dismiss(completion: completion)
-            }
         }
     }
 
@@ -813,33 +773,6 @@ final class OverlayViewState: ObservableObject {
     // Settle animation state
     @Published var isSettling: Bool = false
     var onSettleCompleted: (() -> Void)?
-
-    // Edge Ripple visual feedback state
-    @Published var isRippleEnabled: Bool = {
-        UserDefaults.standard.object(forKey: "isRippleEnabled") as? Bool ?? true
-    }() {
-        didSet {
-            UserDefaults.standard.set(isRippleEnabled, forKey: "isRippleEnabled")
-        }
-    }
-    @Published var rippleIntensity: Float = 1.00
-    @Published var isRippling: Bool = false
-    var onRippleCompleted: (() -> Void)?
-
-    func triggerRipple(onCompleted: (() -> Void)? = nil) {
-        guard isRippleEnabled else {
-            onCompleted?()
-            return
-        }
-        isRippling = true
-        onRippleCompleted = onCompleted
-        requestRender()
-    }
-
-    func cancelRipple() {
-        isRippling = false
-        onRippleCompleted = nil
-    }
 
     func nextSetting() {
         let list = TunableSetting.allDisplayedSettings
@@ -1517,7 +1450,6 @@ private class KeyCatchingWindow: NSWindow {
     var onArrowLeft: (() -> Void)?
     var onArrowRight: (() -> Void)?
     var onReset: (() -> Void)?
-    var onTriggerRipple: (() -> Void)?
     var onMouseDown: (() -> Void)?
     var onActivity: (() -> Void)?
 
@@ -1558,8 +1490,6 @@ private class KeyCatchingWindow: NSWindow {
             onToggleHeadMode?()
         case 15: // 'R' key
             onReset?()
-        case 13: // 'W' key (Wave / Ripple feedback)
-            onTriggerRipple?()
         default:
             let char = event.charactersIgnoringModifiers?.lowercased()
             if char == "c" {
@@ -1574,8 +1504,7 @@ private class KeyCatchingWindow: NSWindow {
                 onToggleFrostedGlass?()
             } else if char == "h" {
                 onToggleHUD?()
-            } else if char == "w" || char == "p" {
-                onTriggerRipple?()
+
             } else {
                 super.keyDown(with: event)
             }
@@ -1626,12 +1555,6 @@ private struct FullscreenPerspectiveContainer: View {
                 shadowIntensity: state.shadowIntensity,
                 isSettling: state.isSettling,
                 isTransitionBlurEnabled: state.isTransitionBlurEnabled,
-                isRippleEnabled: state.isRippleEnabled,
-                rippleIntensity: state.rippleIntensity,
-                isRippling: state.isRippling,
-                onRippleCompleted: {
-                    state.onRippleCompleted?()
-                },
                 onSettleCompleted: {
                     state.onSettleCompleted?()
                 },
@@ -1705,12 +1628,6 @@ private struct ExternalMonitorContainer: View {
             maxDarken: controller.externalDarken,
             isSettling: controller.isExternalSettling,
             isTransitionBlurEnabled: controller.viewState.isTransitionBlurEnabled,
-            isRippleEnabled: controller.viewState.isRippleEnabled,
-            rippleIntensity: controller.viewState.rippleIntensity,
-            isRippling: controller.viewState.isRippling,
-            onRippleCompleted: {
-                controller.viewState.onRippleCompleted?()
-            },
             onSettleCompleted: {
                 controller.onExternalSettleCompleted?()
             },
