@@ -18,14 +18,47 @@ struct MultiScreenSnapshots {
     var builtinTextures: PreparedDisplayTexture?
     var externalSnapshots: [(screen: NSScreen, displayID: CGDirectDisplayID, image: CGImage, textures: PreparedDisplayTexture?)] = []
 
+    var hasBuiltin: Bool {
+        builtinSnapshot != nil || builtinTextures != nil
+    }
+
     var hasExternalSnapshots: Bool {
         !externalSnapshots.isEmpty
     }
 }
 
+enum TextureResolutionQuality: String, CaseIterable, Identifiable {
+    case efficient = "Efficient (Half-Res, ~6MB)"
+    case balanced = "Balanced (~12MB)"
+    case native = "Native (Full Retina)"
+
+    var id: String { rawValue }
+
+    var scaleFactor: Double {
+        switch self {
+        case .efficient: return 0.50
+        case .balanced:  return 0.75
+        case .native:    return 1.00
+        }
+    }
+}
+
 @MainActor
 final class ScreenCaptureManager: ObservableObject {
-    @Published var latestSnapshot: CGImage?
+    var captureExternalDisplays: Bool = true
+
+    @Published var textureQuality: TextureResolutionQuality = {
+        if let raw = UserDefaults.standard.string(forKey: "textureResolutionQuality"),
+           let quality = TextureResolutionQuality(rawValue: raw) {
+            return quality
+        }
+        return .efficient
+    }() {
+        didSet {
+            UserDefaults.standard.set(textureQuality.rawValue, forKey: "textureResolutionQuality")
+            invalidateSnapshots()
+        }
+    }
 
     private let metalDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
     private lazy var metalQueue: MTLCommandQueue? = metalDevice?.makeCommandQueue()
@@ -47,15 +80,16 @@ final class ScreenCaptureManager: ObservableObject {
     nonisolated static func prepareTextures(
         from image: CGImage,
         device: (any MTLDevice)?,
-        queue: (any MTLCommandQueue)?
+        queue: (any MTLCommandQueue)?,
+        scaleFactor: Double = 0.5
     ) -> PreparedDisplayTexture? {
         guard let device = device, let queue = queue else { return nil }
 
         let loader = MTKTextureLoader(device: device)
         guard let sourceTexture = try? loader.newTexture(cgImage: image, options: [
             .SRGB: false,
-            .generateMipmaps: false,
-            .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+            .generateMipmaps: true,
+            .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)
         ]) else {
             return nil
         }
@@ -73,7 +107,8 @@ final class ScreenCaptureManager: ObservableObject {
             return nil
         }
 
-        let blurFilter = MPSImageGaussianBlur(device: device, sigma: 40)
+        let sigma = max(Float(40.0 * scaleFactor), 12.0)
+        let blurFilter = MPSImageGaussianBlur(device: device, sigma: sigma)
         blurFilter.edgeMode = .clamp
         blurFilter.encode(commandBuffer: commandBuffer, sourceTexture: sourceTexture, destinationTexture: target)
         commandBuffer.commit()
@@ -85,14 +120,18 @@ final class ScreenCaptureManager: ObservableObject {
 
     /// Synchronous zero-latency snapshot getter for instant presentation.
     func getImmediateSnapshots() -> MultiScreenSnapshots? {
-        guard isFresh, let warm = warmSnapshots, warm.builtinSnapshot != nil else { return nil }
+        guard isFresh, let warm = warmSnapshots, warm.hasBuiltin else { return nil }
         return warm
     }
 
     /// Checks if the cached snapshot is recently taken (within last 2.5 seconds).
     var isFresh: Bool {
-        guard warmSnapshots?.builtinSnapshot != nil else { return false }
+        guard warmSnapshots?.hasBuiltin == true else { return false }
         return (CACurrentMediaTime() - lastCaptureTimestamp) < freshnessDuration
+    }
+
+    var hasWarmOrInFlightCapture: Bool {
+        inFlightCaptureTask != nil || warmSnapshots != nil
     }
 
     /// Starts a proactive background capture so snapshots are immediately available when the lid reaches 90°.
@@ -107,7 +146,7 @@ final class ScreenCaptureManager: ObservableObject {
             guard let self = self else { return MultiScreenSnapshots() }
             let snaps = await self.performCaptureAllScreens()
             guard !Task.isCancelled else { return MultiScreenSnapshots() }
-            if snaps.builtinSnapshot != nil {
+            if snaps.hasBuiltin {
                 self.warmSnapshots = snaps
                 self.lastCaptureTimestamp = CACurrentMediaTime()
             }
@@ -120,10 +159,10 @@ final class ScreenCaptureManager: ObservableObject {
     func refreshSnapshots() async -> MultiScreenSnapshots? {
         if let inFlight = inFlightCaptureTask {
             let snaps = await inFlight.value
-            return snaps.builtinSnapshot != nil ? snaps : nil
+            return snaps.hasBuiltin ? snaps : nil
         }
         let snaps = await performCaptureAllScreens()
-        if snaps.builtinSnapshot != nil {
+        if snaps.hasBuiltin {
             self.warmSnapshots = snaps
             self.lastCaptureTimestamp = CACurrentMediaTime()
             return snaps
@@ -146,20 +185,20 @@ final class ScreenCaptureManager: ObservableObject {
 
     /// Captures snapshots across all connected displays (uses warm snapshot if available, or awaits in-flight).
     func captureAllScreens() async -> MultiScreenSnapshots {
-        if let warm = warmSnapshots, warm.builtinSnapshot != nil && isFresh {
+        if let warm = warmSnapshots, warm.hasBuiltin && isFresh {
             return warm
         }
         if let inFlight = inFlightCaptureTask {
             let snaps = await inFlight.value
             self.inFlightCaptureTask = nil
-            if snaps.builtinSnapshot != nil {
+            if snaps.hasBuiltin {
                 self.warmSnapshots = snaps
                 self.lastCaptureTimestamp = CACurrentMediaTime()
                 return snaps
             }
         }
         let snaps = await performCaptureAllScreens()
-        if snaps.builtinSnapshot != nil {
+        if snaps.hasBuiltin {
             self.warmSnapshots = snaps
             self.lastCaptureTimestamp = CACurrentMediaTime()
         }
@@ -184,8 +223,10 @@ final class ScreenCaptureManager: ObservableObject {
             let device = self.metalDevice
             let queue = self.metalQueue
 
+            let scaleFactor = self.textureQuality.scaleFactor
+
             enum CaptureTaskResult: Sendable {
-                case builtin(image: CGImage?, textures: PreparedDisplayTexture?)
+                case builtin(image: CGImage, textures: PreparedDisplayTexture?)
                 case external(displayID: CGDirectDisplayID, image: CGImage, textures: PreparedDisplayTexture?)
             }
 
@@ -195,40 +236,49 @@ final class ScreenCaptureManager: ObservableObject {
                 if let builtinScreen = builtin,
                    let builtinID = Self.displayID(for: builtinScreen),
                    let display = content.displays.first(where: { $0.displayID == builtinID }) ?? content.displays.first {
-                    let scale = Int(builtinScreen.backingScaleFactor)
                     group.addTask {
                         let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
                         let config = SCStreamConfiguration()
-                        config.width = display.width * scale
-                        config.height = display.height * scale
+                        // SCDisplay.width and display.height are already physical native pixels.
+                        // Applying configurable scaleFactor drops memory by up to 90% without perceptible loss in 3D perspective warp.
+                        let targetWidth = max(Int(Double(display.width) * scaleFactor), 1280)
+                        let targetHeight = Int(Double(targetWidth) * Double(display.height) / Double(display.width))
+                        config.width = targetWidth
+                        config.height = targetHeight
                         config.showsCursor = false
+                        config.scalesToFit = true
 
                         if let img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) {
-                            let textures = Self.prepareTextures(from: img, device: device, queue: queue)
+                            let textures = Self.prepareTextures(from: img, device: device, queue: queue, scaleFactor: scaleFactor)
                             return .builtin(image: img, textures: textures)
                         }
                         return nil
                     }
                 }
 
-                // 2. External displays
-                for extScreen in externalScreens {
-                    guard let extID = Self.displayID(for: extScreen),
-                          let display = content.displays.first(where: { $0.displayID == extID }) else { continue }
+                // 2. External displays (only captured when enabled by user setting)
+                if self.captureExternalDisplays {
+                    for extScreen in externalScreens {
+                        guard let extID = Self.displayID(for: extScreen),
+                              let display = content.displays.first(where: { $0.displayID == extID }) else { continue }
 
-                    let scale = Int(extScreen.backingScaleFactor)
-                    group.addTask {
-                        let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-                        let config = SCStreamConfiguration()
-                        config.width = display.width * scale
-                        config.height = display.height * scale
-                        config.showsCursor = false
+                        group.addTask {
+                            let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
+                            let config = SCStreamConfiguration()
+                            // External displays only need ambient background perspective; clamp to 1080p
+                            let targetWidth = min(Int(Double(display.width) * scaleFactor), 1920)
+                            let targetHeight = max(Int(Double(targetWidth) * Double(display.height) / Double(display.width)), 720)
+                            config.width = targetWidth
+                            config.height = targetHeight
+                            config.showsCursor = false
+                            config.scalesToFit = true
 
-                        if let img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) {
-                            let textures = Self.prepareTextures(from: img, device: device, queue: queue)
-                            return .external(displayID: extID, image: img, textures: textures)
+                            if let img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) {
+                                let textures = Self.prepareTextures(from: img, device: device, queue: queue, scaleFactor: scaleFactor)
+                                return .external(displayID: extID, image: img, textures: textures)
+                            }
+                            return nil
                         }
-                        return nil
                     }
                 }
 
@@ -244,11 +294,8 @@ final class ScreenCaptureManager: ObservableObject {
             for item in capturedItems {
                 switch item {
                 case .builtin(let img, let textures):
-                    if let img = img {
-                        result.builtinSnapshot = img
-                        result.builtinTextures = textures
-                        self.latestSnapshot = img
-                    }
+                    result.builtinSnapshot = img
+                    result.builtinTextures = textures
                 case .external(let displayID, let img, let textures):
                     if let extScreen = externalScreens.first(where: { Self.displayID(for: $0) == displayID }) {
                         result.externalSnapshots.append((screen: extScreen, displayID: displayID, image: img, textures: textures))

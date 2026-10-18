@@ -40,7 +40,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private let lock = os_unfair_lock_t.allocate(capacity: 1)
 
     // MARK: - Tracking Modes & Published State
-    @Published var mode: HeadTrackingMode = .continuous {
+    @Published var mode: HeadTrackingMode = .snapshotOnClose {
         didSet {
             UserDefaults.standard.set(mode.rawValue, forKey: "headTrackingMode")
             handleModeChanged()
@@ -79,6 +79,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var smoothedZ: Float = 1.0
     private var lastDetectionTime: CFTimeInterval = 0.0
     private var uiUpdateCounter: Int = 0
+    private var continuousFrameSkipCounter: Int = 0
 
     // Reference calibration
     private let nominalFaceSize: Float = 0.22 // Typical face width ratio at ~50cm
@@ -93,7 +94,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         } else if let legacyEnabled = UserDefaults.standard.object(forKey: "isHeadTrackingEnabled") as? Bool {
             self.mode = legacyEnabled ? .snapshotOnClose : .disabled
         } else {
-            self.mode = .continuous
+            self.mode = .snapshotOnClose
         }
 
         self.authorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
@@ -352,6 +353,14 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard mode != .disabled else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // In continuous mode, skip every second frame to halve Vision CPU load while maintaining ~15-30 FPS tracking
+        if !isSnapshotPending && mode == .continuous {
+            continuousFrameSkipCounter += 1
+            if continuousFrameSkipCounter % 2 != 0 {
+                return
+            }
+        }
 
         let requestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         let faceRequest = VNDetectFaceRectanglesRequest()

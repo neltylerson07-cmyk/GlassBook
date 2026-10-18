@@ -668,6 +668,97 @@ static float sampleClockShadow(float2 clockUV,
     return clamp(softShadow, 0.0f, 1.0f);
 }
 
+// MARK: - Progressive Optical Defocus & Native Variable Blur
+// Eliminates linear cross-dissolve/fading artifacts by dynamically convolving across
+// multi-scale frequency bands (LODs) and expanding the Circle of Confusion (CoC) radius,
+// seamlessly transitioning into deep Gaussian blur with native Apple vibrancy preservation.
+static float4 sampleProgressiveBlur(texture2d<float> sharpTex,
+                                    texture2d<float> blurredTex,
+                                    sampler smp,
+                                    float2 uv,
+                                    float blurAmount,
+                                    float2 texStep,
+                                    float2 chromaticOffset = float2(0.0f)) {
+    // 0. Early exit for perfectly sharp content
+    if (blurAmount <= 0.0005f) {
+        return sharpTex.sample(smp, uv, level(0.0f));
+    }
+
+    // Normalized progress with perceptual S-curve response
+    float b = clamp(blurAmount, 0.0f, 1.0f);
+
+    // Dynamic Circle of Confusion (CoC) radius in texels:
+    // Expands smoothly from 0 -> ~36 texels
+    float cocRadius = pow(b, 1.25f) * 36.0f;
+    
+    // Hardware mipmap level for anti-aliased multi-scale frequency attenuation
+    float lod = clamp(log2(1.0f + cocRadius * 0.75f), 0.0f, 5.0f);
+
+    // Center tap
+    float centerWeight = 1.2f;
+    float4 accum;
+    if (dot(chromaticOffset, chromaticOffset) > 0.0000001f) {
+        float rCh = sharpTex.sample(smp, uv + chromaticOffset, level(lod)).r;
+        float gCh = sharpTex.sample(smp, uv, level(lod)).g;
+        float bCh = sharpTex.sample(smp, uv - chromaticOffset, level(lod)).b;
+        float aCh = sharpTex.sample(smp, uv, level(lod)).a;
+        accum = float4(rCh, gCh, bCh, aCh) * centerWeight;
+    } else {
+        accum = sharpTex.sample(smp, uv, level(lod)) * centerWeight;
+    }
+    float totalWeight = centerWeight;
+
+    // 12-tap Vogel / Fibonacci spiral distribution for optimal 2D Poisson-disc spatial uniformity
+    // (Aperture-conformed Circle of Confusion)
+    const float GOLDEN_ANGLE = 2.39996323f;
+    const int NUM_TAPS = 12;
+
+    for (int i = 0; i < NUM_TAPS; ++i) {
+        float theta = float(i) * GOLDEN_ANGLE;
+        float r = sqrt((float(i) + 0.5f) / float(NUM_TAPS));
+        float2 dir = float2(cos(theta), sin(theta));
+        float2 tapUV = uv + dir * (r * cocRadius * texStep);
+        float w = exp(-r * r * 2.0f);
+
+        if (dot(chromaticOffset, chromaticOffset) > 0.0000001f) {
+            float rCh = sharpTex.sample(smp, tapUV + chromaticOffset, level(lod)).r;
+            float gCh = sharpTex.sample(smp, tapUV, level(lod)).g;
+            float bCh = sharpTex.sample(smp, tapUV - chromaticOffset, level(lod)).b;
+            float aCh = sharpTex.sample(smp, tapUV, level(lod)).a;
+            accum += float4(rCh, gCh, bCh, aCh) * w;
+        } else {
+            accum += sharpTex.sample(smp, tapUV, level(lod)) * w;
+        }
+        totalWeight += w;
+    }
+
+    float4 opticalBlur = accum / max(totalWeight, 0.0001f);
+
+    // As blur amount reaches medium-to-deep levels (b > 0.20), smoothly blend into
+    // the pre-filtered deep Gaussian blur (sigma=40) to provide ultra-clean, noise-free
+    // large-aperture diffusion without undersampling artifacts.
+    float deepTransition = smoothstep(0.20f, 0.75f, b);
+    float4 deepColor;
+    if (dot(chromaticOffset, chromaticOffset) > 0.0000001f) {
+        float r = blurredTex.sample(smp, uv + chromaticOffset).r;
+        float g = blurredTex.sample(smp, uv).g;
+        float bCol = blurredTex.sample(smp, uv - chromaticOffset).b;
+        deepColor = float4(r, g, bCol, 1.0f);
+    } else {
+        deepColor = blurredTex.sample(smp, uv);
+    }
+
+    float4 result = mix(opticalBlur, deepColor, deepTransition);
+
+    // Native Apple Material Vibrancy:
+    // Preserves luminance, saturation, and contrast so blurred backdrops remain rich and lively
+    float luma = dot(result.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+    float vibrancy = 1.0f + 0.16f * smoothstep(0.08f, 0.75f, b);
+    result.rgb = mix(float3(luma), result.rgb, vibrancy);
+
+    return result;
+}
+
 fragment float4 fragment_main(RasterizerData in [[stage_in]],
                               texture2d<float> screenTexture [[texture(0)]],
                               texture2d<float> blurredTexture [[texture(1)]],
@@ -685,12 +776,14 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
     float currentTheta = min(targetAngle, uprightRad);
     float delta = uprightRad - currentTheta;
 
+    float2 screenTexStep = float2(1.0f / max(float(screenTexture.get_width()), 1.0f),
+                                  1.0f / max(float(screenTexture.get_height()), 1.0f));
+
     // Upright at 90° or wider, or settled: render flat and completely sharp edge-to-edge
     if (delta <= 0.0001f || uniforms.settleProgress >= 0.999f) {
         float4 base = screenTexture.sample(textureSampler, uv);
         if (uniforms.transitionBlur > 0.001f) {
-            float4 introBlurColor = blurredTexture.sample(textureSampler, uv);
-            base = mix(base, introBlurColor, uniforms.transitionBlur * 0.70f);
+            base = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, uv, uniforms.transitionBlur, screenTexStep);
         }
         if (uniforms.showCalibrator > 0.5f) {
             float4 calib = calibratorTexture.sample(textureSampler, uv);
@@ -718,9 +811,8 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
                 // Optical liquid glass refraction
                 float2 refractOffset = glassNormal2D * 0.020f;
                 float2 refractUV = clamp(uv - refractOffset, 0.0f, 1.0f);
-                float4 refSharp = screenTexture.sample(textureSampler, refractUV);
-                float4 refBlur = blurredTexture.sample(textureSampler, refractUV);
-                float3 glassBg = mix(refSharp.rgb, refBlur.rgb, 0.30f);
+                float4 refBlur = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, refractUV, 0.35f, screenTexStep);
+                float3 glassBg = refBlur.rgb;
 
                 // Subtle chromatic dispersion
                 glassBg.r = mix(glassBg.r, screenTexture.sample(textureSampler, clamp(refractUV - glassNormal2D * 0.003f, 0.0f, 1.0f)).r, 0.35f);
@@ -839,29 +931,20 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
     float4 frameColor = float4(0.0f, 0.0f, 0.0f, 1.0f);
 
     if (isInside) {
-        // 4. Sample and Blend Content with Frosted Glass Optical Model
-        float4 sharpColor = screenTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f));
+        // 4. Sample Content with Progressive Optical Blur & Frosted Glass Optical Model
+        float effectiveBlurAmount = localBlur;
+        if (uniforms.transitionBlur > 0.001f) {
+            effectiveBlurAmount = max(effectiveBlurAmount, uniforms.transitionBlur);
+        }
 
         if (frostAmount > 0.001f) {
             // Chromatic dispersion through screen-space grain facets
             float2 dispOffset = float2(0.0022f, 0.0012f) * frostAmount;
-            float r = blurredTexture.sample(textureSampler, clamp(finalUV + dispOffset, 0.0f, 1.0f)).r;
-            float g = blurredTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f)).g;
-            float b = blurredTexture.sample(textureSampler, clamp(finalUV - dispOffset, 0.0f, 1.0f)).b;
-            float4 dispersedBlurred = float4(r, g, b, 1.0f);
-
             float baseFrost = mix(0.40f, 0.88f, s) * frostAmount;
-            float effectiveBlur = clamp(max(localBlur, baseFrost * uniforms.blurIntensity), 0.0f, 1.0f);
-            frameColor = mix(sharpColor, dispersedBlurred, effectiveBlur);
+            float combinedBlur = clamp(max(effectiveBlurAmount, baseFrost * uniforms.blurIntensity), 0.0f, 1.0f);
+            frameColor = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, clamp(finalUV, 0.0f, 1.0f), combinedBlur, screenTexStep, dispOffset);
         } else {
-            float4 blurredColor = blurredTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f));
-            frameColor = mix(sharpColor, blurredColor, localBlur);
-        }
-
-        // Quick entrance blur transition between desktop and snapshot
-        if (uniforms.transitionBlur > 0.001f) {
-            float4 introBlurColor = blurredTexture.sample(textureSampler, clamp(finalUV, 0.0f, 1.0f));
-            frameColor = mix(frameColor, introBlurColor, uniforms.transitionBlur * 0.70f);
+            frameColor = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, clamp(finalUV, 0.0f, 1.0f), effectiveBlurAmount, screenTexStep);
         }
 
         // 5. Progressive Depth Shadow (Delayed to <= 70°)
@@ -955,9 +1038,8 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
                 // Optical liquid glass refraction of the 3D-warped background behind the digits
                 float2 refractOffset = glassNormal2D * 0.022f;
                 float2 refractUV = clamp(finalUV - refractOffset, 0.0f, 1.0f);
-                float4 refSharp = screenTexture.sample(textureSampler, refractUV);
-                float4 refBlur = blurredTexture.sample(textureSampler, refractUV);
-                float3 glassBg = mix(refSharp.rgb, refBlur.rgb, 0.30f);
+                float4 refBlur = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, refractUV, 0.35f, screenTexStep);
+                float3 glassBg = refBlur.rgb;
 
                 // Chromatic dispersion through curved meniscus
                 glassBg.r = mix(glassBg.r, screenTexture.sample(textureSampler, clamp(refractUV - glassNormal2D * 0.003f, 0.0f, 1.0f)).r, 0.35f);
@@ -1019,11 +1101,13 @@ fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
     float currentTheta = min(targetAngle, uprightRad);
     float delta = uprightRad - currentTheta;
 
+    float2 screenTexStep = float2(1.0f / max(float(screenTexture.get_width()), 1.0f),
+                                  1.0f / max(float(screenTexture.get_height()), 1.0f));
+
     if (delta <= 0.0001f) {
         float4 base = screenTexture.sample(textureSampler, uv);
         if (uniforms.transitionBlur > 0.001f) {
-            float4 blurCol = blurredTexture.sample(textureSampler, uv);
-            base = mix(base, blurCol, uniforms.transitionBlur * 0.70f);
+            base = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, uv, uniforms.transitionBlur, screenTexStep);
         }
         return base;
     }
@@ -1068,14 +1152,11 @@ fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
 
     // 2. Progressive Blur: sample textures with clamped coordinates to allow seamless outward edge bleed
     float2 sampleUV = clamp(centeredUV, 0.0f, 1.0f);
-    float4 sharpCol = screenTexture.sample(textureSampler, sampleUV);
-    float4 blurCol = blurredTexture.sample(textureSampler, sampleUV);
-    float4 col = mix(sharpCol, blurCol, blurFactor);
-
-    // Quick entrance blur transition between desktop and snapshot
+    float effectiveExternalBlur = blurFactor;
     if (uniforms.transitionBlur > 0.001f) {
-        col = mix(col, blurCol, uniforms.transitionBlur * 0.70f);
+        effectiveExternalBlur = max(effectiveExternalBlur, uniforms.transitionBlur);
     }
+    float4 col = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, sampleUV, effectiveExternalBlur, screenTexStep);
 
     // 3. Progressive Darkening & Vignette
     float darkenFactor = clamp(activeProgress * uniforms.maxDarken, 0.0f, 0.85f);

@@ -54,7 +54,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
         
         // Match the display's native refresh rate (up to 120Hz ProMotion)
         mtkView.preferredFramesPerSecond = 120
-        mtkView.isPaused = false
+        mtkView.isPaused = (snapshot == nil && preloadedTexture == nil)
         mtkView.enableSetNeedsDisplay = false
         return mtkView
     }
@@ -70,6 +70,13 @@ struct PerspectiveMetalView: NSViewRepresentable {
         if context.coordinator.activationCount != activationCount {
             context.coordinator.activationCount = activationCount
             context.coordinator.reset(angle: fallbackAngle)
+            nsView.isPaused = false
+            nsView.preferredFramesPerSecond = 120
+        }
+
+        let shouldPause = (snapshot == nil && preloadedTexture == nil) || context.coordinator.hasFinishedSettle
+        if nsView.isPaused != shouldPause {
+            nsView.isPaused = shouldPause
         }
 
         context.coordinator.onFirstFrame = onFirstFrame
@@ -165,6 +172,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
             let desc = MTLSamplerDescriptor()
             desc.minFilter = .linear
             desc.magFilter = .linear
+            desc.mipFilter = .linear
             desc.sAddressMode = .clampToEdge
             desc.tAddressMode = .clampToEdge
             return device.makeSamplerState(descriptor: desc)
@@ -347,8 +355,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 let loader = MTKTextureLoader(device: device)
                 let loadedTexture = try? loader.newTexture(cgImage: snapshot, options: [
                     .SRGB: false,
-                    .generateMipmaps: false,
-                    .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+                    .generateMipmaps: true,
+                    .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)
                 ])
                 self.texture = loadedTexture
 
@@ -356,6 +364,11 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 if let sourceTexture = loadedTexture {
                     self.blurredTexture = makeBlurredTexture(from: sourceTexture, device: device, sigma: 40)
                 }
+            } else if snapshot == nil && preloadedTexture == nil {
+                // Release heavy GPU textures when overlay is dismissed
+                self.texture = nil
+                self.blurredTexture = nil
+                self.lastLoadedSnapshotID = nil
             }
 
             if let calibImage = calibratorImage, calibImage !== lastLoadedCalibratorID, let device = self.device {
@@ -483,6 +496,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
                     isSettling = false
                     hasFinishedSettle = true
                     settleFactor = 1.0
+                    view.isPaused = true
                     DispatchQueue.main.async { [weak self] in
                         self?.onSettleCompleted?()
                     }
@@ -500,6 +514,8 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 targetAngle = min(self.targetAngle, 90.0)
             }
 
+            let speed = abs(sensor?.latestVelocity ?? 0.0)
+
             if isFirstFrame {
                 isFirstFrame = false
                 if isTransitionBlurEnabled {
@@ -510,7 +526,6 @@ struct PerspectiveMetalView: NSViewRepresentable {
             } else if isSettling {
                 self.smoothedAngle = frozenAngle
             } else {
-                let speed = abs(sensor?.latestVelocity ?? 0.0)
                 // do not change thisc
                 let smoothingFactor = min(max(0.18 + speed * 0.005, 0.22), 0.35)
                 self.smoothedAngle += (targetAngle - self.smoothedAngle) * smoothingFactor
@@ -534,6 +549,18 @@ struct PerspectiveMetalView: NSViewRepresentable {
             let angleRadians = Float(smoothedAngle * (.pi / 180.0))
 
             let head = headTracker.getHeadPosition()
+
+            // Dynamic frame rate scaling:
+            // Render at full 120 FPS when moving or transitioning, but scale down to 30 FPS when the lid is held stationary.
+            let isAngleSettled = speed < 0.4 && abs(targetAngle - self.smoothedAngle) < 0.005
+            let isIntroActive = isTransitionBlurEnabled && introStartTime > 0.0
+            let isClockTransition = isClockActive ? (clockProgress < 1.0) : (clockProgress > 0.0)
+            let isHeadActive = headTracker.mode == .continuous && head.isTracking
+
+            let targetFPS = (isSettling || isIntroActive || isClockTransition || !isAngleSettled || isHeadActive) ? 120 : 30
+            if view.preferredFramesPerSecond != targetFPS {
+                view.preferredFramesPerSecond = targetFPS
+            }
 
             // Detect physical MacBook camera notch geometry
             let screen = view.window?.screen ?? NSScreen.main

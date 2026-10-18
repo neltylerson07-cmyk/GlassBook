@@ -33,7 +33,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         }
 
         mtkView.preferredFramesPerSecond = 120
-        mtkView.isPaused = false
+        mtkView.isPaused = (snapshot == nil && preloadedTexture == nil)
         mtkView.enableSetNeedsDisplay = false
         return mtkView
     }
@@ -48,6 +48,13 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
         if context.coordinator.activationCount != activationCount {
             context.coordinator.activationCount = activationCount
             context.coordinator.reset(angle: fallbackAngle)
+            nsView.isPaused = false
+            nsView.preferredFramesPerSecond = 120
+        }
+
+        let shouldPause = (snapshot == nil && preloadedTexture == nil) || context.coordinator.hasFinishedSettle
+        if nsView.isPaused != shouldPause {
+            nsView.isPaused = shouldPause
         }
 
         context.coordinator.onFirstFrame = onFirstFrame
@@ -209,14 +216,18 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                 let loader = MTKTextureLoader(device: device)
                 let loadedTexture = try? loader.newTexture(cgImage: snapshot, options: [
                     .SRGB: false,
-                    .generateMipmaps: false,
-                    .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue)
+                    .generateMipmaps: true,
+                    .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)
                 ])
                 self.texture = loadedTexture
 
                 if let sourceTexture = loadedTexture {
                     self.blurredTexture = makeBlurredTexture(from: sourceTexture, device: device, sigma: 40)
                 }
+            } else if snapshot == nil && preloadedTexture == nil {
+                self.texture = nil
+                self.blurredTexture = nil
+                self.lastLoadedSnapshotID = nil
             }
         }
 
@@ -283,6 +294,7 @@ struct ExternalDisplayMetalView: NSViewRepresentable {
                     isSettling = false
                     hasFinishedSettle = true
                     settleFactor = 1.0
+                    view.isPaused = true
                     DispatchQueue.main.async { [weak self] in
                         self?.onSettleCompleted?()
                     }

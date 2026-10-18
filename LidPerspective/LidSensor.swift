@@ -13,8 +13,14 @@ final class LidSensor: ObservableObject {
     private var _atomicLeadDelta: Double = 0.0
     private let lock = os_unfair_lock_t.allocate(capacity: 1)
 
-    // Sliding window of angle measurements for smooth velocity regression
-    private var sampleHistory: [(timestamp: CFTimeInterval, angle: Double)] = []
+    // Fixed circular ring buffer of angle measurements for zero-allocation velocity regression
+    private struct SensorSample {
+        var timestamp: CFTimeInterval = 0.0
+        var angle: Double = 0.0
+    }
+    private var sampleRingBuffer = [SensorSample](repeating: SensorSample(), count: 48)
+    private var sampleRingHead = 0
+    private var sampleRingCount = 0
     private let historyWindowDuration: CFTimeInterval = 0.14 // 140ms sliding window
 
     var latestAngle: Double {
@@ -173,6 +179,10 @@ final class LidSensor: ObservableObject {
         sensorQueue.async { [weak self] in
             guard let self = self else { return }
             var report = [UInt8](repeating: 0, count: 8)
+            var lastMovementTime: CFTimeInterval = CACurrentMediaTime()
+            var lastDispatchedAngle: Double = -999.0
+            var lastDispatchedVelocity: Double = -999.0
+            var lastDispatchedTime: CFTimeInterval = 0.0
 
             while self.isRunning {
                 guard let device = self.lidDevice else {
@@ -190,6 +200,8 @@ final class LidSensor: ObservableObject {
                     &length
                 )
 
+                var sleepMicros: useconds_t = 4000
+
                 if result == kIOReturnSuccess && length >= 3 {
                     let rawValue = UInt16(report[1]) | (UInt16(report[2]) << 8)
                     let angle = Double(rawValue)
@@ -197,31 +209,43 @@ final class LidSensor: ObservableObject {
                     if angle >= 0 && angle <= 180 {
                         let now = CACurrentMediaTime()
 
-                        // Maintain sliding history of angle samples over the last window
-                        self.sampleHistory.append((timestamp: now, angle: angle))
-                        let cutoff = now - self.historyWindowDuration
-                        self.sampleHistory.removeAll { $0.timestamp < cutoff }
+                        // Maintain fixed circular ring buffer of samples (0 heap allocations)
+                        self.sampleRingBuffer[self.sampleRingHead] = SensorSample(timestamp: now, angle: angle)
+                        self.sampleRingHead = (self.sampleRingHead + 1) % 48
+                        if self.sampleRingCount < 48 {
+                            self.sampleRingCount += 1
+                        }
 
                         // Calculate angular velocity using linear regression slope (degrees / sec)
                         var calculatedVelocity = 0.0
-                        let count = self.sampleHistory.count
-                        if count >= 2 {
-                            var sumT = 0.0
-                            var sumA = 0.0
-                            for sample in self.sampleHistory {
+                        let cutoff = now - self.historyWindowDuration
+                        var sumT = 0.0
+                        var sumA = 0.0
+                        var validCount = 0
+
+                        for i in 0..<self.sampleRingCount {
+                            let sample = self.sampleRingBuffer[i]
+                            if sample.timestamp >= cutoff {
                                 sumT += sample.timestamp
                                 sumA += sample.angle
+                                validCount += 1
                             }
-                            let meanT = sumT / Double(count)
-                            let meanA = sumA / Double(count)
+                        }
+
+                        if validCount >= 2 {
+                            let meanT = sumT / Double(validCount)
+                            let meanA = sumA / Double(validCount)
 
                             var numerator = 0.0
                             var denominator = 0.0
-                            for sample in self.sampleHistory {
-                                let dt = sample.timestamp - meanT
-                                let da = sample.angle - meanA
-                                numerator += dt * da
-                                denominator += dt * dt
+                            for i in 0..<self.sampleRingCount {
+                                let sample = self.sampleRingBuffer[i]
+                                if sample.timestamp >= cutoff {
+                                    let dt = sample.timestamp - meanT
+                                    let da = sample.angle - meanA
+                                    numerator += dt * da
+                                    denominator += dt * dt
+                                }
                             }
 
                             if denominator > 1e-6 {
@@ -245,26 +269,65 @@ final class LidSensor: ObservableObject {
 
                         // Detect 90° threshold crossing immediately
                         let crossedThreshold = (prev >= 90.0 && angle < 90.0) || (prev < 90.0 && angle >= 90.0)
+                        let isMoving = abs(calculatedVelocity) > 0.4 || abs(angle - prev) >= 0.1
                         let isNearThreshold = (angle >= 85.0 && angle <= 112.0)
-                        let isMoving = abs(calculatedVelocity) > 0.8
-                        let shouldDispatchFast = crossedThreshold || isNearThreshold || isMoving
 
-                        // Low latency dispatch in critical transition zones (~8ms), throttled when stationary (~32ms)
-                        self.uiUpdateCounter += 1
-                        let thresholdLimit = crossedThreshold ? 1 : (shouldDispatchFast ? 2 : 8)
-                        if self.uiUpdateCounter >= thresholdLimit {
-                            self.uiUpdateCounter = 0
-                            DispatchQueue.main.async {
-                                self.displayAngle = angle
-                                self.displayVelocity = calculatedVelocity
-                                self.onAngleChanged?(angle)
+                        if isMoving || crossedThreshold {
+                            lastMovementTime = now
+                        }
+
+                        let stationaryDuration = now - lastMovementTime
+
+                        // Adaptive Polling Rate:
+                        // - Active motion or threshold transition: 4ms (~250 Hz)
+                        // - Settle coast-down (first 150ms after stopping): 5ms (200 Hz)
+                        // - Stationary near threshold (85°-95°): 12ms (~80 Hz) for rapid reaction to lid close
+                        // - Stationary resting angle: 25ms (40 Hz) - cuts idle CPU by ~80% while retaining <25ms response
+                        if stationaryDuration < 0.05 {
+                            sleepMicros = 4000
+                        } else if stationaryDuration < 0.15 {
+                            sleepMicros = 5000
+                        } else if angle >= 85.0 && angle <= 95.0 {
+                            sleepMicros = 12000
+                        } else {
+                            sleepMicros = 25000
+                        }
+
+                        // Check for meaningful changes to dispatch to main thread
+                        let angleDelta = abs(lastDispatchedAngle - angle)
+                        let angleChanged = angleDelta >= 0.08
+                        let velocityChanged = abs(lastDispatchedVelocity - calculatedVelocity) >= 0.2 || (calculatedVelocity == 0.0 && lastDispatchedVelocity != 0.0)
+                        let timeSinceDispatch = now - lastDispatchedTime
+                        let heartbeatNeeded = timeSinceDispatch >= 1.0
+
+                        if crossedThreshold || angleChanged || velocityChanged || (isMoving && timeSinceDispatch >= 0.02) || heartbeatNeeded {
+                            self.uiUpdateCounter += 1
+                            let shouldDispatchFast = crossedThreshold || (isNearThreshold && isMoving)
+                            let thresholdLimit = crossedThreshold ? 1 : (shouldDispatchFast ? 2 : (isMoving ? 4 : 1))
+
+                            if self.uiUpdateCounter >= thresholdLimit {
+                                self.uiUpdateCounter = 0
+                                lastDispatchedAngle = angle
+                                lastDispatchedVelocity = calculatedVelocity
+                                lastDispatchedTime = now
+
+                                DispatchQueue.main.async { [weak self] in
+                                    guard let self = self else { return }
+                                    if abs(self.displayAngle - angle) >= 0.08 {
+                                        self.displayAngle = angle
+                                    }
+                                    if abs(self.displayVelocity - calculatedVelocity) >= 0.2 || (calculatedVelocity == 0.0 && self.displayVelocity != 0.0) {
+                                        self.displayVelocity = calculatedVelocity
+                                    }
+                                    self.onAngleChanged?(angle)
+                                }
                             }
                         }
                     }
                 }
 
-                // Sleep 4ms after reading to prevent queue backlog
-                usleep(4000)
+                // Sleep adaptively to prevent high idle CPU load
+                usleep(sleepMicros)
             }
         }
     }

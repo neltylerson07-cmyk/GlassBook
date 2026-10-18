@@ -203,8 +203,8 @@ final class FullscreenOverlayController: ObservableObject {
 
     /// Dynamically updates Metal textures in-place without touching window visibility
     func updateTextures(snapshots: MultiScreenSnapshots) {
-        if let builtinSnapshot = snapshots.builtinSnapshot {
-            viewState.currentSnapshot = builtinSnapshot
+        if snapshots.hasBuiltin {
+            viewState.currentSnapshot = snapshots.builtinSnapshot
             viewState.currentTexture = snapshots.builtinTextures?.texture
             viewState.currentBlurredTexture = snapshots.builtinTextures?.blurredTexture
         }
@@ -224,7 +224,7 @@ final class FullscreenOverlayController: ObservableObject {
         self.onDismissal = onDismiss
 
         // 1. Setup Built-in Display Overlay (Perspective 3D Warp)
-        if let builtinSnapshot = snapshots.builtinSnapshot,
+        if snapshots.hasBuiltin,
            let screen = snapshots.builtinScreen ?? NSScreen.main {
             // Reset settle state when showing fresh overlay
             viewState.activationCount += 1
@@ -232,7 +232,7 @@ final class FullscreenOverlayController: ObservableObject {
                 viewState.onSettleCompleted = nil
             viewState.showCalibrator = showCalibrator
             viewState.screenSize = screen.frame.size
-            viewState.currentSnapshot = builtinSnapshot
+            viewState.currentSnapshot = snapshots.builtinSnapshot
             viewState.currentTexture = snapshots.builtinTextures?.texture
             viewState.currentBlurredTexture = snapshots.builtinTextures?.blurredTexture
             viewState.updateForTrackingMode(headTracker.mode)
@@ -334,7 +334,7 @@ final class FullscreenOverlayController: ObservableObject {
             self.isExternalShowing = !self.externalWindows.isEmpty
         }
 
-        let builtinShown = (snapshots.builtinSnapshot != nil && builtinWindow != nil)
+        let builtinShown = (snapshots.hasBuiltin && builtinWindow != nil)
         let externalShown = !externalWindows.isEmpty
         self.isShowing = (builtinShown || externalShown)
     }
@@ -389,6 +389,7 @@ final class FullscreenOverlayController: ObservableObject {
         }, completionHandler: {
             for win in windows {
                 win.orderOut(nil)
+                win.contentView = nil
             }
             DispatchQueue.main.async {
                 completion?()
@@ -437,6 +438,9 @@ final class FullscreenOverlayController: ObservableObject {
         // Order out immediately:
         activeWindow.orderOut(nil)
         activeWindow.alphaValue = 0.0
+        self.viewState.currentSnapshot = nil
+        self.viewState.currentTexture = nil
+        self.viewState.currentBlurredTexture = nil
         DispatchQueue.main.async {
             if self.externalWindows.isEmpty {
                 handler?()
@@ -511,6 +515,7 @@ final class FullscreenOverlayController: ObservableObject {
             for extWindow in activeExternals {
                 extWindow.orderOut(nil)
                 extWindow.alphaValue = 0.0
+                extWindow.contentView = nil
             }
             DispatchQueue.main.async {
                 handler?()
@@ -650,6 +655,7 @@ struct PerspectivePreset: Equatable {
     var stretchBalance: Float
     var lowAngleCompensation: Float
     var lookaheadTime: Double
+    var keyboardTilt: Float
     var keyboardReach: Float
     var keyboardOffset: Float
     var keyboardParallaxSensitivity: Float
@@ -660,12 +666,13 @@ struct PerspectivePreset: Equatable {
     /// Calibrated settings active when camera head tracking is enabled (.continuous or .snapshotOnClose)
     static let cameraMode = PerspectivePreset(
         keystoneStrength: 0.28,
-        stretchBalance: 0.36,
+        stretchBalance: 0.28,
         lowAngleCompensation: 0.30,
         lookaheadTime: 0.28,
-        keyboardReach: 0.38,
+        keyboardTilt: 0.65,
+        keyboardReach: 0.41,
         keyboardOffset: -0.03,
-        keyboardParallaxSensitivity: 0.30,
+        keyboardParallaxSensitivity: 0.35,
         keyboardPitchSensitivity: 2.50,
         headParallaxSensitivity: 0.55,
         headElevationSensitivity: 0.70
@@ -677,6 +684,7 @@ struct PerspectivePreset: Equatable {
         stretchBalance: 0.56,
         lowAngleCompensation: 1.00,
         lookaheadTime: 0.40,
+        keyboardTilt: 0.40,
         keyboardReach: 0.38,
         keyboardOffset: -0.01,
         keyboardParallaxSensitivity: 1.00,
@@ -724,10 +732,10 @@ final class OverlayViewState: ObservableObject {
 
     @Published var headParallaxSensitivity: Float = 0.55
     @Published var headElevationSensitivity: Float = 0.70
-    @Published var keyboardParallaxSensitivity: Float = 0.30
+    @Published var keyboardParallaxSensitivity: Float = 0.35
     @Published var keyboardPitchSensitivity: Float = 2.50
     @Published var keystoneStrength: Float = 0.28
-    @Published var stretchBalance: Float = 0.36
+    @Published var stretchBalance: Float = 0.28
     @Published var lowAngleCompensation: Float = 0.30
     @Published var lookaheadTime: Double = 0.28
     @Published var activationCount: Int = 0
@@ -742,8 +750,8 @@ final class OverlayViewState: ObservableObject {
     @Published var keyboardReflection: Float = 0.44
     @Published var isFrostedGlassEnabled: Bool = true
     @Published var frostedGlass: Float = 0.10
-    @Published var keyboardTilt: Float = 0.40
-    @Published var keyboardReach: Float = 0.38
+    @Published var keyboardTilt: Float = 0.65
+    @Published var keyboardReach: Float = 0.41
     @Published var keyboardBacklight: Float = 1.50
     @Published var keyboardOffset: Float = -0.03
     @Published var keyboardWidth: Float = 0.88
@@ -874,6 +882,7 @@ final class OverlayViewState: ObservableObject {
                 stretchBalance: stretchBalance,
                 lowAngleCompensation: lowAngleCompensation,
                 lookaheadTime: lookaheadTime,
+                keyboardTilt: keyboardTilt,
                 keyboardReach: keyboardReach,
                 keyboardOffset: keyboardOffset,
                 keyboardParallaxSensitivity: keyboardParallaxSensitivity,
@@ -887,6 +896,7 @@ final class OverlayViewState: ObservableObject {
                 stretchBalance: stretchBalance,
                 lowAngleCompensation: lowAngleCompensation,
                 lookaheadTime: lookaheadTime,
+                keyboardTilt: keyboardTilt,
                 keyboardReach: keyboardReach,
                 keyboardOffset: keyboardOffset,
                 keyboardParallaxSensitivity: keyboardParallaxSensitivity,
@@ -902,6 +912,7 @@ final class OverlayViewState: ObservableObject {
         stretchBalance = nextPreset.stretchBalance
         lowAngleCompensation = nextPreset.lowAngleCompensation
         lookaheadTime = nextPreset.lookaheadTime
+        keyboardTilt = nextPreset.keyboardTilt
         keyboardReach = nextPreset.keyboardReach
         keyboardOffset = nextPreset.keyboardOffset
         keyboardParallaxSensitivity = nextPreset.keyboardParallaxSensitivity
@@ -925,6 +936,7 @@ final class OverlayViewState: ObservableObject {
         stretchBalance = preset.stretchBalance
         lowAngleCompensation = preset.lowAngleCompensation
         lookaheadTime = preset.lookaheadTime
+        keyboardTilt = preset.keyboardTilt
         keyboardReach = preset.keyboardReach
         keyboardOffset = preset.keyboardOffset
         keyboardParallaxSensitivity = preset.keyboardParallaxSensitivity
@@ -936,7 +948,6 @@ final class OverlayViewState: ObservableObject {
         keyboardReflection = 0.44
         isFrostedGlassEnabled = true
         frostedGlass = 0.10
-        keyboardTilt = 0.40
         keyboardBacklight = 1.50
         keyboardWidth = 0.88
         keyboardDepthBlur = 0.30
@@ -955,6 +966,7 @@ final class OverlayViewState: ObservableObject {
         self.stretchBalance = initial.stretchBalance
         self.lowAngleCompensation = initial.lowAngleCompensation
         self.lookaheadTime = initial.lookaheadTime
+        self.keyboardTilt = initial.keyboardTilt
         self.keyboardReach = initial.keyboardReach
         self.keyboardOffset = initial.keyboardOffset
         self.keyboardParallaxSensitivity = initial.keyboardParallaxSensitivity
@@ -1607,7 +1619,7 @@ private struct FullscreenPerspectiveContainer: View {
 
 // MARK: - External Monitor Container
 private struct ExternalMonitorContainer: View {
-    let snapshot: CGImage
+    var snapshot: CGImage? = nil
     var preloadedTexture: MTLTexture? = nil
     var preloadedBlurredTexture: MTLTexture? = nil
     let sensor: LidSensor

@@ -33,6 +33,7 @@ struct LidPerspectiveApp: App {
         MenuBarExtra("LidPerspective", systemImage: "laptopcomputer.and.arrow.down") {
             MenuBarMenuView(
                 sensor: sensor,
+                captureManager: captureManager,
                 autoManager: autoManager,
                 overlayController: overlayController,
                 bootstrap: bootstrap,
@@ -57,7 +58,8 @@ struct LidPerspectiveApp: App {
 
 // MARK: - Menu Bar View (Agent Interface)
 struct MenuBarMenuView: View {
-    @ObservedObject var sensor: LidSensor
+    let sensor: LidSensor
+    @ObservedObject var captureManager: ScreenCaptureManager
     @ObservedObject var autoManager: AutoPerspectiveManager
     @ObservedObject var overlayController: FullscreenOverlayController
     @ObservedObject var bootstrap: AppBootstrap
@@ -69,11 +71,8 @@ struct MenuBarMenuView: View {
             Text("LidPerspective Agent")
                 .font(.headline)
 
-            Text(String(format: "Hinge Angle: %.1f° (%.1f°/s)", sensor.displayAngle, sensor.currentVelocity))
-                .font(.caption)
-
             Text("Status: \(autoManager.statusDescription)")
-                .font(.caption2)
+                .font(.caption)
 
             Divider()
 
@@ -178,6 +177,20 @@ struct MenuBarMenuView: View {
             Toggle("Frosted Glass Effect", isOn: overlayController.frostedGlassBinding)
             Toggle("Simulated Keyboard Reflection", isOn: overlayController.keyboardReflectionBinding)
 
+            Menu("Texture Resolution Quality") {
+                ForEach(TextureResolutionQuality.allCases) { quality in
+                    Button {
+                        captureManager.textureQuality = quality
+                    } label: {
+                        if captureManager.textureQuality == quality {
+                            Label(quality.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(quality.rawValue)
+                        }
+                    }
+                }
+            }
+
             Divider()
 
             Button {
@@ -205,9 +218,49 @@ struct MenuBarMenuView: View {
     }
 }
 
+// MARK: - Sensor Readings Box (Isolated View to Prevent Global Invalidation)
+private struct SensorReadingsBox: View {
+    @ObservedObject var sensor: LidSensor
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("Lid Hinge Angle")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%.1f°", sensor.displayAngle))
+                    .font(.title3.weight(.bold).monospacedDigit())
+            }
+
+            HStack {
+                Text("Angular Velocity")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%+.1f°/s", sensor.currentVelocity))
+                    .font(.body.monospacedDigit())
+            }
+
+            HStack {
+                Text("Sensor Status")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(sensor.isAvailable ? "Connected (IOHID)" : "Simulation Mode")
+                    .font(.caption.bold())
+                    .foregroundStyle(sensor.isAvailable ? .green : .orange)
+            }
+        }
+        .padding()
+        .background(.quaternary.opacity(0.4))
+        .cornerRadius(10)
+    }
+}
+
 // MARK: - Main Settings & Diagnostics Window
 struct ContentView: View {
-    @ObservedObject var sensor: LidSensor
+    let sensor: LidSensor
     @ObservedObject var captureManager: ScreenCaptureManager
     @ObservedObject var bootstrap: AppBootstrap
     @ObservedObject var overlayController: FullscreenOverlayController
@@ -244,39 +297,8 @@ struct ContentView: View {
 
             Divider()
 
-            // Sensor Readings Box
-            VStack(spacing: 10) {
-                HStack {
-                    Text("Lid Hinge Angle")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(String(format: "%.1f°", sensor.displayAngle))
-                        .font(.title3.weight(.bold).monospacedDigit())
-                }
-
-                HStack {
-                    Text("Angular Velocity")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(String(format: "%+.1f°/s", sensor.currentVelocity))
-                        .font(.body.monospacedDigit())
-                }
-
-                HStack {
-                    Text("Sensor Status")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(sensor.isAvailable ? "Connected (IOHID)" : "Simulation Mode")
-                        .font(.caption.bold())
-                        .foregroundStyle(sensor.isAvailable ? .green : .orange)
-                }
-            }
-            .padding()
-            .background(.quaternary.opacity(0.4))
-            .cornerRadius(10)
+            // Sensor Readings Box (Isolated)
+            SensorReadingsBox(sensor: sensor)
 
             // Automation Settings
             VStack(spacing: 12) {
@@ -603,6 +625,28 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Texture Resolution & Memory Profile")
+                                .font(.body.weight(.medium))
+                            Text("Scales snapshot and blur texture memory by up to 90% without perceptible loss under 3D warp.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Picker("", selection: $captureManager.textureQuality) {
+                            ForEach(TextureResolutionQuality.allCases) { quality in
+                                Text(quality.rawValue).tag(quality)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 220)
+                    }
                 }
 
                 Divider()

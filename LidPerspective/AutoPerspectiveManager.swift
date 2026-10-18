@@ -82,6 +82,7 @@ final class AutoPerspectiveManager: ObservableObject {
         get { overlayController.isExternalAnimationEnabled }
         set {
             overlayController.isExternalAnimationEnabled = newValue
+            captureManager.captureExternalDisplays = newValue
             objectWillChange.send()
         }
     }
@@ -98,6 +99,12 @@ final class AutoPerspectiveManager: ObservableObject {
     @Published var isArmed: Bool = false
     @Published var isCapturing: Bool = false
     @Published var statusDescription: String = "Initializing..."
+
+    private func updateStatus(_ newStatus: String) {
+        if statusDescription != newStatus {
+            statusDescription = newStatus
+        }
+    }
 
     let sensor: LidSensor
     let captureManager: ScreenCaptureManager
@@ -125,15 +132,16 @@ final class AutoPerspectiveManager: ObservableObject {
         self.sensor = sensor
         self.captureManager = captureManager
         self.overlayController = overlayController
+        self.captureManager.captureExternalDisplays = overlayController.isExternalAnimationEnabled
 
         let initialAngle = sensor.displayAngle
         if initialAngle >= closeThreshold {
             self.isArmed = true
-            self.statusDescription = "Armed — Close lid (<90°) to activate"
+            self.updateStatus("Armed — Close lid (<90°) to activate")
         } else {
             self.isArmed = false
             self.lastSettledAngle = initialAngle >= minUsableAngle ? initialAngle : nil
-            self.statusDescription = "Open lid past 90° to arm automatic mode"
+            self.updateStatus("Open lid past 90° to arm automatic mode")
         }
 
         sensor.onAngleChanged = { [weak self] angle in
@@ -144,7 +152,7 @@ final class AutoPerspectiveManager: ObservableObject {
     func handleAngleUpdate(_ angle: Double) {
         guard isAutoModeEnabled else {
             cancelAllDwellTimers()
-            statusDescription = "Automatic mode disabled"
+            updateStatus("Automatic mode disabled")
             return
         }
 
@@ -160,7 +168,7 @@ final class AutoPerspectiveManager: ObservableObject {
                 isArmed = true
                 lastSettledAngle = nil
                 lastDismissalTime = CACurrentMediaTime()
-                statusDescription = "Armed — Close lid (<90°) to activate"
+                updateStatus("Armed — Close lid (<90°) to activate")
                 return
             }
 
@@ -169,7 +177,7 @@ final class AutoPerspectiveManager: ObservableObject {
                 cancelAllDwellTimers()
                 overlayController.deactivateClockMode()
                 overlayController.cancelSettling()
-                statusDescription = "Lid closing"
+                updateStatus("Lid closing")
                 return
             }
 
@@ -203,7 +211,7 @@ final class AutoPerspectiveManager: ObservableObject {
                     scheduleClockTimer()
                 }
 
-                statusDescription = String(format: "Perspective active (%.1f°)", angle)
+                updateStatus("Perspective active")
             } else {
                 // Holding steady: schedule timers if not already active
                 if overlayController.isExternalShowing && !overlayController.isExternalSettling && externalDwellTimerTask == nil {
@@ -217,9 +225,9 @@ final class AutoPerspectiveManager: ObservableObject {
                 }
 
                 if overlayController.viewState.isClockActive {
-                    statusDescription = String(format: "Clock mode active (%.1f°) — Move lid to resume", angle)
+                    updateStatus("Clock mode active — Move lid to resume")
                 } else {
-                    statusDescription = String(format: "Perspective active (%.1f°)", angle)
+                    updateStatus("Perspective active")
                 }
             }
             return
@@ -233,7 +241,7 @@ final class AutoPerspectiveManager: ObservableObject {
                 isArmed = true
             }
             lastSettledAngle = nil
-            statusDescription = "Armed — Close lid (<90°) to activate"
+            updateStatus("Armed — Close lid (<90°) to activate")
 
             // Pre-warm the builtin overlay window once so show() is 0ms
             overlayController.prepareBuiltinWindow(sensor: sensor)
@@ -246,7 +254,7 @@ final class AutoPerspectiveManager: ObservableObject {
                 if isClosing && !captureManager.isFresh {
                     captureManager.precapture()
                 }
-            } else if angle > precaptureCancelThreshold || sensor.latestVelocity > 0.5 {
+            } else if (angle > precaptureCancelThreshold || sensor.latestVelocity > 0.5) && captureManager.hasWarmOrInFlightCapture {
                 captureManager.cancelPrecapture()
             }
         } else if angle < closeThreshold && angle >= minUsableAngle {
@@ -344,23 +352,22 @@ final class AutoPerspectiveManager: ObservableObject {
 
         overlayController.viewState.currentLidAngle = currentAngle
         overlayController.activateClockMode()
-        statusDescription = String(format: "Clock mode active (%.1f°) — Move lid to resume", currentAngle)
+        updateStatus("Clock mode active — Move lid to resume")
     }
 
     private func handleBuiltinDwellTimeout() {
-        guard overlayController.isShowing, !overlayController.viewState.isSettling else { return }
+        guard overlayController.isShowing, !overlayController.isExternalSettling else { return }
         guard !overlayController.viewState.showCalibrator else { return }
         let currentAngle = sensor.displayAngle
         guard currentAngle >= minUsableAngle && currentAngle < closeThreshold else { return }
 
-        statusDescription = String(format: "Lid settled at %.1f° — Returning to screen...", currentAngle)
-        let settledAngle = currentAngle
+        updateStatus("Lid settled — Returning to screen...")
 
         overlayController.unwarpAndDismissBuiltin { [weak self] in
             guard let self = self else { return }
             self.lastDismissalTime = CACurrentMediaTime()
             self.lastSettledAngle = self.sensor.displayAngle
-            self.statusDescription = String(format: "Screen ready (%.1f°) — Adjust lid to reactivate", self.sensor.displayAngle)
+            self.updateStatus("Screen ready — Adjust lid to reactivate")
         }
     }
 
@@ -391,7 +398,7 @@ final class AutoPerspectiveManager: ObservableObject {
             self.overlayController.show(snapshots: immediateSnapshots, sensor: self.sensor, showCalibrator: showCalibrator) { [weak self] in
                 self?.handleOverlayDismissed()
             }
-            self.statusDescription = "Perspective active"
+            self.updateStatus("Perspective active")
 
             if self.isAutoSettleEnabled && self.autoSettleDelay > 0 && !showCalibrator {
                 self.scheduleBuiltinDwellTimer()
@@ -407,13 +414,13 @@ final class AutoPerspectiveManager: ObservableObject {
 
         // COLD PATH: If no warm snapshot exists, capture asynchronously
         isCapturing = true
-        statusDescription = "Activating perspective..."
+        updateStatus("Activating perspective...")
 
         Task { [weak self] in
             guard let self = self else { return }
             let snapshots = await self.captureManager.captureAllScreens()
 
-            if snapshots.builtinSnapshot != nil || snapshots.hasExternalSnapshots {
+            if snapshots.hasBuiltin || snapshots.hasExternalSnapshots {
                 self.dwellReferenceAngle = self.sensor.displayAngle
 
                 // Built-in dwell timer (respects user toggle)
@@ -431,9 +438,9 @@ final class AutoPerspectiveManager: ObservableObject {
                 self.overlayController.show(snapshots: snapshots, sensor: self.sensor, showCalibrator: showCalibrator) { [weak self] in
                     self?.handleOverlayDismissed()
                 }
-                self.statusDescription = "Perspective active"
+                self.updateStatus("Perspective active")
             } else {
-                self.statusDescription = "Screen capture failed"
+                self.updateStatus("Screen capture failed")
                 if self.sensor.displayAngle < self.closeThreshold && self.sensor.displayAngle >= self.minUsableAngle {
                     self.isArmed = true
                 }
@@ -451,15 +458,15 @@ final class AutoPerspectiveManager: ObservableObject {
         if sensor.displayAngle < closeThreshold && sensor.displayAngle >= minUsableAngle {
             isArmed = false
             lastSettledAngle = sensor.displayAngle
-            statusDescription = String(format: "Screen ready (%.1f°) — Adjust lid to reactivate", sensor.displayAngle)
+            updateStatus("Screen ready — Adjust lid to reactivate")
         } else if sensor.displayAngle >= closeThreshold {
             isArmed = true
             lastSettledAngle = nil
-            statusDescription = "Armed — Close lid (<90°) to activate"
+            updateStatus("Armed — Close lid (<90°) to activate")
         } else {
             isArmed = false
             lastSettledAngle = nil
-            statusDescription = "Open lid past 92° to re-arm"
+            updateStatus("Open lid past 92° to re-arm")
         }
     }
 
@@ -468,15 +475,15 @@ final class AutoPerspectiveManager: ObservableObject {
         overlayController.deactivateClockMode()
         captureManager.cancelPrecapture()
         if !isAutoModeEnabled {
-            statusDescription = "Automatic mode disabled"
+            updateStatus("Automatic mode disabled")
         } else {
             if sensor.displayAngle >= rearmThreshold {
                 isArmed = true
-                statusDescription = "Armed — Close lid (<90°) to activate"
+                updateStatus("Armed — Close lid (<90°) to activate")
             } else {
                 isArmed = false
                 lastSettledAngle = sensor.displayAngle >= minUsableAngle ? sensor.displayAngle : nil
-                statusDescription = "Open lid past 92° to arm automatic mode"
+                updateStatus("Open lid past 92° to arm automatic mode")
             }
         }
     }
