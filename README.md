@@ -8,7 +8,7 @@
 [![Graphics](https://img.shields.io/badge/Rendering-Metal%203-blue?style=flat)](https://developer.apple.com/metal/)
 
 ---
-![GlassBook Demo](LidPerspective/Assets/IMG_9716.gif)
+![GlassBook Demo](LidPerspective/Assets.xcassets/VideoGIF.dataset/IMG_9716.gif)
 
 ## Overview
 
