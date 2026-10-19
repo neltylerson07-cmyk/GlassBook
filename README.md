@@ -9,7 +9,7 @@
 
 ---
 ![GlassBook Demo](LidPerspective/Assets.xcassets/VideoGIF.dataset/IMG_9716.gif)
-![GlassBook Screen](LidPerspective/Assets.xcassets/ScreenGIF.dataset/Screen Recording 2026-10-18 at 6.50.49 PM.gif)
+
 
 ## Overview
 
