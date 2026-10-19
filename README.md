@@ -1,6 +1,6 @@
 # 🪟 GlassBook (LidPerspective)
 
-> **Real-time 3D hardware-accelerated perspective illusions and StandBy display driven by your MacBook's lid hinge sensor and head tracking, inspired by iPhone Duo.**z
+> **Real-time 3D hardware-accelerated perspective illusions and StandBy display driven by your MacBook's lid hinge sensor and head tracking, inspired by iPhone Duo.**
 
 Press 'C' with the settings window open to calibrate/tweak settings to your preferences.
 
