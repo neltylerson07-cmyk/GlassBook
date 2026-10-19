@@ -81,6 +81,13 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     private var uiUpdateCounter: Int = 0
     private var continuousFrameSkipCounter: Int = 0
 
+    // Pre-allocated Vision face detection request using Neural Engine revision
+    private lazy var faceDetectionRequest: VNDetectFaceRectanglesRequest = {
+        let request = VNDetectFaceRectanglesRequest()
+        request.revision = VNDetectFaceRectanglesRequestRevision3
+        return request
+    }()
+
     // Reference calibration
     private let nominalFaceSize: Float = 0.22 // Typical face width ratio at ~50cm
 
@@ -168,7 +175,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             captureQueue.async { [weak self] in
                 guard let self = self else { return }
                 if !self.isSnapshotPending {
-                    self.teardownSession()
+                    self.pauseSession()
                 }
             }
         }
@@ -200,8 +207,8 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
 
         let now = CACurrentMediaTime()
-        // Debounce if already captured within 1.2s (unless forced)
-        if !force && (now - lastSnapshotTimestamp < 1.2) && _atomicIsTracking {
+        // Debounce if already captured within 0.6s (unless forced)
+        if !force && (now - lastSnapshotTimestamp < 0.6) && _atomicIsTracking {
             return
         }
 
@@ -216,7 +223,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             guard let self = self else { return }
             self.setupAndStartSession()
 
-            // Safety timeout: if no face found within 800ms, shut camera off to prevent draining power
+            // Safety timeout: if no face found within 1.2s, shut camera off to prevent draining power
             self.snapshotTimeoutWorkItem?.cancel()
             let timeout = DispatchWorkItem { [weak self] in
                 guard let self = self, self.isSnapshotPending else { return }
@@ -225,11 +232,34 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
                     self.isSnapping = false
                 }
                 if self.mode == .snapshotOnClose || self.mode != .continuous || self.activeRequestCount == 0 {
-                    self.teardownSession()
+                    self.pauseSession()
                 }
             }
             self.snapshotTimeoutWorkItem = timeout
-            self.captureQueue.asyncAfter(deadline: .now() + 0.8, execute: timeout)
+            self.captureQueue.asyncAfter(deadline: .now() + 1.2, execute: timeout)
+        }
+    }
+
+    /// Cancels any in-flight snapshot attempt and turns off the camera
+    func cancelSnapshot() {
+        captureQueue.async { [weak self] in
+            guard let self = self, self.isSnapshotPending else { return }
+            self.isSnapshotPending = false
+            self.snapshotTimeoutWorkItem?.cancel()
+            self.snapshotTimeoutWorkItem = nil
+            DispatchQueue.main.async {
+                self.isSnapping = false
+            }
+            if self.mode == .snapshotOnClose && self.activeRequestCount == 0 {
+                self.pauseSession()
+            }
+        }
+    }
+
+    /// Resets the debounce timestamp so the next snapshot attempt runs immediately without delay
+    func resetDebounce() {
+        captureQueue.async { [weak self] in
+            self?.lastSnapshotTimestamp = 0.0
         }
     }
 
@@ -249,7 +279,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
             guard let self = self else { return }
             self.activeRequestCount = max(0, self.activeRequestCount - 1)
             if self.activeRequestCount == 0 && !self.isSnapshotPending {
-                self.teardownSession()
+                self.pauseSession()
             }
         }
     }
@@ -288,7 +318,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
     }
 
-    // MARK: - Camera Session Setup & Teardown
+    // MARK: - Camera Session Setup, Pause & Teardown
     private func setupAndStartSession() {
         guard captureSession == nil else {
             if let session = captureSession, !session.isRunning {
@@ -324,7 +354,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         let videoOutput = AVCaptureVideoDataOutput()
         videoOutput.alwaysDiscardsLateVideoFrames = true
         videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         ]
         videoOutput.setSampleBufferDelegate(self, queue: captureQueue)
 
@@ -341,12 +371,18 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         self.isSessionRunning = true
     }
 
-    private func teardownSession() {
+    /// Stops camera streaming and turns off the indicator LED, keeping the session pipeline allocated for fast wakeup
+    private func pauseSession() {
         if let session = captureSession, session.isRunning {
             session.stopRunning()
         }
-        captureSession = nil
         isSessionRunning = false
+    }
+
+    /// Completely releases camera hardware session
+    private func teardownSession() {
+        pauseSession()
+        captureSession = nil
     }
 
     // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -363,11 +399,10 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
         }
 
         let requestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        let faceRequest = VNDetectFaceRectanglesRequest()
 
         do {
-            try requestHandler.perform([faceRequest])
-            if let observation = faceRequest.results?.first {
+            try requestHandler.perform([faceDetectionRequest])
+            if let observation = faceDetectionRequest.results?.first {
                 handleFaceObservation(observation)
             } else {
                 handleNoFaceDetected()
@@ -428,7 +463,7 @@ final class HeadTracker: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
             // In snapshot mode, immediately stop camera and turn off indicator LED
             if mode == .snapshotOnClose {
-                teardownSession()
+                pauseSession()
             }
             return
         }

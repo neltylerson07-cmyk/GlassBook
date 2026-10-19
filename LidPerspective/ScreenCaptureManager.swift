@@ -16,14 +16,9 @@ struct MultiScreenSnapshots {
     var builtinSnapshot: CGImage?
     var builtinScreen: NSScreen?
     var builtinTextures: PreparedDisplayTexture?
-    var externalSnapshots: [(screen: NSScreen, displayID: CGDirectDisplayID, image: CGImage, textures: PreparedDisplayTexture?)] = []
 
     var hasBuiltin: Bool {
         builtinSnapshot != nil || builtinTextures != nil
-    }
-
-    var hasExternalSnapshots: Bool {
-        !externalSnapshots.isEmpty
     }
 }
 
@@ -45,8 +40,6 @@ enum TextureResolutionQuality: String, CaseIterable, Identifiable {
 
 @MainActor
 final class ScreenCaptureManager: ObservableObject {
-    var captureExternalDisplays: Bool = true
-
     @Published var textureQuality: TextureResolutionQuality = {
         if let raw = UserDefaults.standard.string(forKey: "textureResolutionQuality"),
            let quality = TextureResolutionQuality(rawValue: raw) {
@@ -205,7 +198,7 @@ final class ScreenCaptureManager: ObservableObject {
         return snaps
     }
 
-    /// Internal capture worker executing concurrent multi-display queries and background texture preparation.
+    /// Internal capture worker executing capture and background texture preparation for the built-in display.
     private func performCaptureAllScreens() async -> MultiScreenSnapshots {
         var result = MultiScreenSnapshots()
 
@@ -218,94 +211,35 @@ final class ScreenCaptureManager: ObservableObject {
             let allScreens = NSScreen.screens
             let builtin = allScreens.first(where: { Self.isBuiltin(screen: $0) }) ?? NSScreen.main ?? allScreens.first
             result.builtinScreen = builtin
-            let externalScreens = allScreens.filter { $0 != builtin }
 
             let device = self.metalDevice
             let queue = self.metalQueue
-
             let scaleFactor = self.textureQuality.scaleFactor
 
-            enum CaptureTaskResult: Sendable {
-                case builtin(image: CGImage, textures: PreparedDisplayTexture?)
-                case external(displayID: CGDirectDisplayID, image: CGImage, textures: PreparedDisplayTexture?)
-            }
+            if let builtinScreen = builtin,
+               let builtinID = Self.displayID(for: builtinScreen),
+               let display = content.displays.first(where: { $0.displayID == builtinID }) ?? content.displays.first {
+                let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
+                let config = SCStreamConfiguration()
+                // SCDisplay.width and display.height are already physical native pixels.
+                // Applying configurable scaleFactor drops memory by up to 90% without perceptible loss in 3D perspective warp.
+                let targetWidth = max(Int(Double(display.width) * scaleFactor), 1280)
+                let targetHeight = Int(Double(targetWidth) * Double(display.height) / Double(display.width))
+                config.width = targetWidth
+                config.height = targetHeight
+                config.showsCursor = false
+                config.scalesToFit = true
 
-            // Capture all screens concurrently
-            let capturedItems: [CaptureTaskResult] = await withTaskGroup(of: CaptureTaskResult?.self) { group in
-                // 1. Builtin display
-                if let builtinScreen = builtin,
-                   let builtinID = Self.displayID(for: builtinScreen),
-                   let display = content.displays.first(where: { $0.displayID == builtinID }) ?? content.displays.first {
-                    group.addTask {
-                        let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-                        let config = SCStreamConfiguration()
-                        // SCDisplay.width and display.height are already physical native pixels.
-                        // Applying configurable scaleFactor drops memory by up to 90% without perceptible loss in 3D perspective warp.
-                        let targetWidth = max(Int(Double(display.width) * scaleFactor), 1280)
-                        let targetHeight = Int(Double(targetWidth) * Double(display.height) / Double(display.width))
-                        config.width = targetWidth
-                        config.height = targetHeight
-                        config.showsCursor = false
-                        config.scalesToFit = true
-
-                        if let img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) {
-                            let textures = Self.prepareTextures(from: img, device: device, queue: queue, scaleFactor: scaleFactor)
-                            return .builtin(image: img, textures: textures)
-                        }
-                        return nil
-                    }
-                }
-
-                // 2. External displays (only captured when enabled by user setting)
-                if self.captureExternalDisplays {
-                    for extScreen in externalScreens {
-                        guard let extID = Self.displayID(for: extScreen),
-                              let display = content.displays.first(where: { $0.displayID == extID }) else { continue }
-
-                        group.addTask {
-                            let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-                            let config = SCStreamConfiguration()
-                            // External displays only need ambient background perspective; clamp to 1080p
-                            let targetWidth = min(Int(Double(display.width) * scaleFactor), 1920)
-                            let targetHeight = max(Int(Double(targetWidth) * Double(display.height) / Double(display.width)), 720)
-                            config.width = targetWidth
-                            config.height = targetHeight
-                            config.showsCursor = false
-                            config.scalesToFit = true
-
-                            if let img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) {
-                                let textures = Self.prepareTextures(from: img, device: device, queue: queue, scaleFactor: scaleFactor)
-                                return .external(displayID: extID, image: img, textures: textures)
-                            }
-                            return nil
-                        }
-                    }
-                }
-
-                var items = [CaptureTaskResult]()
-                for await item in group {
-                    if let valid = item {
-                        items.append(valid)
-                    }
-                }
-                return items
-            }
-
-            for item in capturedItems {
-                switch item {
-                case .builtin(let img, let textures):
+                if let img = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) {
+                    let textures = Self.prepareTextures(from: img, device: device, queue: queue, scaleFactor: scaleFactor)
                     result.builtinSnapshot = img
                     result.builtinTextures = textures
-                case .external(let displayID, let img, let textures):
-                    if let extScreen = externalScreens.first(where: { Self.displayID(for: $0) == displayID }) {
-                        result.externalSnapshots.append((screen: extScreen, displayID: displayID, image: img, textures: textures))
-                    }
                 }
             }
 
             return result
         } catch {
-            print("Multi-screen capture failed: \(error.localizedDescription)")
+            print("Screen capture failed: \(error.localizedDescription)")
             return result
         }
     }

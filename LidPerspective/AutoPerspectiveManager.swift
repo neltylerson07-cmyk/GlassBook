@@ -78,15 +78,6 @@ final class AutoPerspectiveManager: ObservableObject {
         }
     }
 
-    var isExternalDisplayEnabled: Bool {
-        get { overlayController.isExternalAnimationEnabled }
-        set {
-            overlayController.isExternalAnimationEnabled = newValue
-            captureManager.captureExternalDisplays = newValue
-            objectWillChange.send()
-        }
-    }
-
     var formattedDelay: String {
         if autoSettleDelay.truncatingRemainder(dividingBy: 1) == 0 {
             return String(format: "%.0fs", autoSettleDelay)
@@ -116,9 +107,8 @@ final class AutoPerspectiveManager: ObservableObject {
     let precaptureThreshold: Double = 105.0 // Proactively captures only when closing towards 90°
     let precaptureCancelThreshold: Double = 110.0
 
-    // Separate settle tracking for built-in and external displays
+    // Separate settle tracking for built-in display
     private var builtinDwellTimerTask: Task<Void, Never>?
-    private var externalDwellTimerTask: Task<Void, Never>?
     private var clockTimerTask: Task<Void, Never>?
     private var dwellReferenceAngle: Double = 90.0
     private var lastSettledAngle: Double?
@@ -132,7 +122,6 @@ final class AutoPerspectiveManager: ObservableObject {
         self.sensor = sensor
         self.captureManager = captureManager
         self.overlayController = overlayController
-        self.captureManager.captureExternalDisplays = overlayController.isExternalAnimationEnabled
 
         let initialAngle = sensor.displayAngle
         if initialAngle >= closeThreshold {
@@ -165,6 +154,8 @@ final class AutoPerspectiveManager: ObservableObject {
                 overlayController.cancelSettling()
                 overlayController.dismiss()
                 captureManager.cancelPrecapture()
+                HeadTracker.shared.cancelSnapshot()
+                HeadTracker.shared.resetDebounce()
                 isArmed = true
                 lastSettledAngle = nil
                 lastDismissalTime = CACurrentMediaTime()
@@ -194,14 +185,9 @@ final class AutoPerspectiveManager: ObservableObject {
                 }
 
                 // If user resumes moving while settling, cancel immediately and resume live 3D perspective!
-                if overlayController.isSettling || overlayController.isExternalSettling {
+                if overlayController.isSettling {
                     overlayController.cancelSettling()
                     lastSettledAngle = nil
-                }
-
-                // Restart external dwell timer if external overlay is still showing
-                if overlayController.isExternalShowing {
-                    scheduleExternalDwellTimer()
                 }
 
                 // Restart builtin dwell timer if enabled
@@ -214,10 +200,6 @@ final class AutoPerspectiveManager: ObservableObject {
                 updateStatus("Perspective active")
             } else {
                 // Holding steady: schedule timers if not already active
-                if overlayController.isExternalShowing && !overlayController.isExternalSettling && externalDwellTimerTask == nil {
-                    scheduleExternalDwellTimer()
-                }
-
                 if isAutoSettleEnabled && autoSettleDelay > 0 && !overlayController.viewState.isSettling && builtinDwellTimerTask == nil {
                     scheduleBuiltinDwellTimer()
                 } else if isClockModeEnabled && (!isAutoSettleEnabled || autoSettleDelay <= 0) && !overlayController.viewState.isClockActive && clockTimerTask == nil {
@@ -247,15 +229,25 @@ final class AutoPerspectiveManager: ObservableObject {
             overlayController.prepareBuiltinWindow(sensor: sensor)
         }
 
-        // Proactive desktop capture when closing towards 90° (ScreenCaptureKit only, no camera)
+        // Proactive desktop capture and head tracking snapshot when closing towards 90°
         if angle >= closeThreshold {
             let isClosing = sensor.latestVelocity < -0.6
             if angle <= precaptureThreshold && isArmed {
-                if isClosing && !captureManager.isFresh {
-                    captureManager.precapture()
+                if isClosing {
+                    if !captureManager.isFresh {
+                        captureManager.precapture()
+                    }
+                    if HeadTracker.shared.mode == .snapshotOnClose {
+                        HeadTracker.shared.captureFaceSnapshot()
+                    }
                 }
-            } else if (angle > precaptureCancelThreshold || sensor.latestVelocity > 0.5) && captureManager.hasWarmOrInFlightCapture {
-                captureManager.cancelPrecapture()
+            } else if (angle > precaptureCancelThreshold || sensor.latestVelocity > 0.5) {
+                if captureManager.hasWarmOrInFlightCapture {
+                    captureManager.cancelPrecapture()
+                }
+                if HeadTracker.shared.mode == .snapshotOnClose {
+                    HeadTracker.shared.cancelSnapshot()
+                }
             }
         } else if angle < closeThreshold && angle >= minUsableAngle {
             let now = CACurrentMediaTime()
@@ -288,92 +280,49 @@ final class AutoPerspectiveManager: ObservableObject {
             builtinDwellTimerTask = nil
             return
         }
-        let delay = autoSettleDelay
+
         builtinDwellTimerTask = Task { [weak self] in
-            let nanoseconds = UInt64(delay * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
             guard let self = self else { return }
-            self.handleBuiltinDwellTimeout()
+            do {
+                let delayNanoseconds = UInt64(self.autoSettleDelay * 1_000_000_000)
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+                guard !Task.isCancelled else { return }
+
+                self.overlayController.unwarpAndDismissBuiltin()
+                self.updateStatus("Settled flat — Move lid to resume")
+            } catch {
+                // Task was cancelled by new lid motion
+            }
         }
     }
 
-    /// Dwell timer for external monitor(s) — ALWAYS active so external monitors remain usable!
-    private func scheduleExternalDwellTimer() {
-        externalDwellTimerTask?.cancel()
-        guard overlayController.isExternalShowing else {
-            externalDwellTimerTask = nil
+    /// Standby clock timer
+    private func scheduleClockTimer() {
+        clockTimerTask?.cancel()
+        guard isClockModeEnabled else {
+            clockTimerTask = nil
             return
         }
 
-        // Use autoSettleDelay if positive, otherwise fall back to 1.0s so it settles no matter what
-        let delay = (isAutoSettleEnabled && autoSettleDelay > 0) ? autoSettleDelay : (previousNonZeroDelay > 0 ? previousNonZeroDelay : 1.0)
-
-        externalDwellTimerTask = Task { [weak self] in
-            let nanoseconds = UInt64(delay * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
+        clockTimerTask = Task { [weak self] in
             guard let self = self else { return }
-            self.handleExternalDwellTimeout()
+            do {
+                try await Task.sleep(nanoseconds: 1_200_000_000)
+                guard !Task.isCancelled else { return }
+
+                self.overlayController.activateClockMode()
+                self.updateStatus("Clock mode active — Move lid to resume")
+            } catch {
+                // Task was cancelled
+            }
         }
     }
 
     private func cancelAllDwellTimers() {
         builtinDwellTimerTask?.cancel()
         builtinDwellTimerTask = nil
-        externalDwellTimerTask?.cancel()
-        externalDwellTimerTask = nil
         clockTimerTask?.cancel()
         clockTimerTask = nil
-    }
-
-    /// Dwell timer for digital clock mode when stationary with auto-settle off (3.0s delay)
-    private func scheduleClockTimer() {
-        clockTimerTask?.cancel()
-        guard isClockModeEnabled && (!isAutoSettleEnabled || autoSettleDelay <= 0) else {
-            clockTimerTask = nil
-            return
-        }
-        clockTimerTask = Task { [weak self] in
-            let nanoseconds = UInt64(3.0 * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
-            guard let self = self else { return }
-            self.handleClockTimeout()
-        }
-    }
-
-    private func handleClockTimeout() {
-        guard overlayController.isShowing, !overlayController.viewState.isSettling else { return }
-        guard !overlayController.viewState.showCalibrator else { return }
-        guard isClockModeEnabled && (!isAutoSettleEnabled || autoSettleDelay <= 0) else { return }
-        let currentAngle = sensor.displayAngle
-        guard currentAngle >= minUsableAngle && currentAngle < closeThreshold else { return }
-
-        overlayController.viewState.currentLidAngle = currentAngle
-        overlayController.activateClockMode()
-        updateStatus("Clock mode active — Move lid to resume")
-    }
-
-    private func handleBuiltinDwellTimeout() {
-        guard overlayController.isShowing, !overlayController.isExternalSettling else { return }
-        guard !overlayController.viewState.showCalibrator else { return }
-        let currentAngle = sensor.displayAngle
-        guard currentAngle >= minUsableAngle && currentAngle < closeThreshold else { return }
-
-        updateStatus("Lid settled — Returning to screen...")
-
-        overlayController.unwarpAndDismissBuiltin { [weak self] in
-            guard let self = self else { return }
-            self.lastDismissalTime = CACurrentMediaTime()
-            self.lastSettledAngle = self.sensor.displayAngle
-            self.updateStatus("Screen ready — Adjust lid to reactivate")
-        }
-    }
-
-    private func handleExternalDwellTimeout() {
-        guard overlayController.isExternalShowing, !overlayController.isExternalSettling else { return }
-        overlayController.unwarpAndDismissExternal()
     }
 
     func triggerPerspective(showCalibrator: Bool = false) {
@@ -405,9 +354,6 @@ final class AutoPerspectiveManager: ObservableObject {
             } else if self.isClockModeEnabled && !showCalibrator {
                 self.scheduleClockTimer()
             }
-            if immediateSnapshots.hasExternalSnapshots && self.overlayController.isExternalAnimationEnabled {
-                self.scheduleExternalDwellTimer()
-            }
 
             return
         }
@@ -420,7 +366,7 @@ final class AutoPerspectiveManager: ObservableObject {
             guard let self = self else { return }
             let snapshots = await self.captureManager.captureAllScreens()
 
-            if snapshots.hasBuiltin || snapshots.hasExternalSnapshots {
+            if snapshots.hasBuiltin {
                 self.dwellReferenceAngle = self.sensor.displayAngle
 
                 // Built-in dwell timer (respects user toggle)
@@ -428,11 +374,6 @@ final class AutoPerspectiveManager: ObservableObject {
                     self.scheduleBuiltinDwellTimer()
                 } else if self.isClockModeEnabled && !showCalibrator {
                     self.scheduleClockTimer()
-                }
-
-                // External dwell timer: ALWAYS scheduled so external monitor remains usable
-                if snapshots.hasExternalSnapshots && self.overlayController.isExternalAnimationEnabled {
-                    self.scheduleExternalDwellTimer()
                 }
 
                 self.overlayController.show(snapshots: snapshots, sensor: self.sensor, showCalibrator: showCalibrator) { [weak self] in
@@ -455,6 +396,7 @@ final class AutoPerspectiveManager: ObservableObject {
         overlayController.deactivateClockMode()
         captureManager.invalidateSnapshots()
         sensor.resetPrediction()
+        HeadTracker.shared.resetDebounce()
         if sensor.displayAngle < closeThreshold && sensor.displayAngle >= minUsableAngle {
             isArmed = false
             lastSettledAngle = sensor.displayAngle
@@ -474,6 +416,7 @@ final class AutoPerspectiveManager: ObservableObject {
         cancelAllDwellTimers()
         overlayController.deactivateClockMode()
         captureManager.cancelPrecapture()
+        HeadTracker.shared.cancelSnapshot()
         if !isAutoModeEnabled {
             updateStatus("Automatic mode disabled")
         } else {

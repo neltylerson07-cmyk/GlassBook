@@ -559,10 +559,10 @@ inline float sampleClockOccupancy(texture2d<float> tex, sampler smp, float2 uv) 
         return 0.0f;
     }
     float a = tex.sample(smp, uv).a;
-    // Widget cards have translucent background alpha (~0.36); text digits have alpha (~0.72 - 0.96).
-    // Smoothly map [0.015, 0.35] -> [0.0, 1.0] so that both widget cards and text digits
-    // register as full-strength casters of the drop shadow.
-    return smoothstep(0.015f, 0.35f, a);
+    // Continuous perceptual alpha mapping: translucent widget cards (alpha ~0.36) cast
+    // a soft, refined shadow, while opaque elements (clock hands, text) cast a firm shadow.
+    // Avoid hard binarization steps which cause stepped ghost silhouettes.
+    return pow(clamp(a, 0.0f, 1.0f), 0.75f);
 }
 
 static float sampleClockShadow(float2 clockUV,
@@ -571,101 +571,63 @@ static float sampleClockShadow(float2 clockUV,
                                float tiltAmount,
                                float headX) {
     // Optical drop shadow direction: light is overhead and slightly in front.
-    // In perspective, as the screen tilts back, the shadow projects further down the screen plane.
-    float shadowOffsetY = mix(0.012f, 0.032f, tiltAmount);
+    // In perspective, as the screen tilts back, the shadow projects slightly down the screen plane.
+    float shadowOffsetY = mix(0.005f, 0.015f, tiltAmount);
     // Subtle lateral parallax offset responding to head tracking position
-    float shadowOffsetX = -headX * 0.007f;
+    float shadowOffsetX = -headX * 0.003f;
     float2 shadowOffset = float2(shadowOffsetX, shadowOffsetY);
 
     float2 centerUV = clockUV - shadowOffset;
 
-    // Quick bounds check with safety margin for the broad blur footprint
-    if (centerUV.x < -0.20f || centerUV.x > 1.20f || centerUV.y < -0.20f || centerUV.y > 1.20f) {
+    // Quick bounds check with safety margin for blur footprint
+    if (centerUV.x < -0.10f || centerUV.x > 1.10f || centerUV.y < -0.10f || centerUV.y > 1.10f) {
         return 0.0f;
     }
 
     float2 texStep = float2(1.0f / max(float(clockTexture.get_width()), 1.0f),
                             1.0f / max(float(clockTexture.get_height()), 1.0f));
 
-    // Multi-tier hierarchical blur kernel for a very blurred, rich ambient & drop shadow:
-    // Center tap + Ring 1 (Contact, r=14) + Ring 2 (Body, r=36) + Ring 3 (Diffuse, r=75)
-    // + Ring 4 (Ambient Penumbra, r=135) + Ring 5 (Ultra-wide Halo, r=210)
+    // Dynamic blur radius in texels: tight contact core scaling smoothly with tilt
+    float blurRadius = mix(24.0f, 40.0f, tiltAmount);
+
+    // Vogel spiral (golden-angle) sampling distribution:
+    // Every sample is at a unique radius and angle, completely eliminating
+    // concentric ring banding and stepped ghost silhouettes.
+    const float2 vogelOffsets[16] = {
+        float2( 0.1768f,  0.0000f),
+        float2(-0.2258f,  0.2068f),
+        float2( 0.0345f, -0.3938f),
+        float2( 0.2869f,  0.3703f),
+        float2(-0.4907f, -0.1983f),
+        float2( 0.4071f, -0.4208f),
+        float2(-0.0631f,  0.6339f),
+        float2(-0.3807f, -0.5732f),
+        float2( 0.6877f,  0.2185f),
+        float2(-0.6402f,  0.4191f),
+        float2( 0.2289f, -0.7766f),
+        float2( 0.3541f,  0.7709f),
+        float2(-0.7675f, -0.4357f),
+        float2( 0.8123f, -0.4124f),
+        float2(-0.4328f,  0.8661f),
+        float2(-0.1996f, -0.9634f)
+    };
+
+    // Center tap anchors contact shadow
     float centerVal = sampleClockOccupancy(clockTexture, textureSampler, centerUV);
+    float totalWeight = 1.5f;
+    float accum = centerVal * 1.5f;
 
-    // Ring 1: 4 orthogonal samples at r=14 texels (~7 pt)
-    const float2 ring1Offsets[4] = {
-        float2( 1.0000f,  0.0000f), float2(-1.0000f,  0.0000f),
-        float2( 0.0000f,  1.0000f), float2( 0.0000f, -1.0000f)
-    };
-    float r1Avg = 0.0f;
-    for (int i = 0; i < 4; ++i) {
-        r1Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring1Offsets[i] * (texStep * 14.0f));
+    // Convolve with quadratic falloff (1 - r^2) ensuring C0/C1 continuity at blur perimeter
+    for (int i = 0; i < 16; ++i) {
+        float rSq = (float(i) + 0.5f) * (1.0f / 16.0f);
+        float w = 1.0f - rSq;
+        float2 sampleUV = centerUV + vogelOffsets[i] * (texStep * blurRadius);
+        accum += sampleClockOccupancy(clockTexture, textureSampler, sampleUV) * w;
+        totalWeight += w;
     }
-    r1Avg *= 0.25f;
 
-    // Ring 2: 6 hexagonal samples at r=36 texels (~18 pt)
-    const float2 ring2Offsets[6] = {
-        float2( 0.8660f,  0.5000f), float2(-0.8660f,  0.5000f),
-        float2( 0.0000f,  1.0000f), float2( 0.0000f, -1.0000f),
-        float2(-0.8660f, -0.5000f), float2( 0.8660f, -0.5000f)
-    };
-    float r2Avg = 0.0f;
-    for (int i = 0; i < 6; ++i) {
-        r2Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring2Offsets[i] * (texStep * 36.0f));
-    }
-    r2Avg *= (1.0f / 6.0f);
-
-    // Ring 3: 8 octagonal samples at r=75 texels (~37 pt)
-    const float2 ring3Offsets[8] = {
-        float2( 1.0000f,  0.0000f), float2(-1.0000f,  0.0000f),
-        float2( 0.0000f,  1.0000f), float2( 0.0000f, -1.0000f),
-        float2( 0.7071f,  0.7071f), float2(-0.7071f,  0.7071f),
-        float2( 0.7071f, -0.7071f), float2(-0.7071f, -0.7071f)
-    };
-    float r3Avg = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-        r3Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring3Offsets[i] * (texStep * 75.0f));
-    }
-    r3Avg *= 0.125f;
-
-    // Ring 4: 8 interleaved samples at r=135 texels (~67 pt)
-    const float2 ring4Offsets[8] = {
-        float2( 0.9239f,  0.3827f), float2(-0.9239f,  0.3827f),
-        float2( 0.3827f,  0.9239f), float2(-0.3827f,  0.9239f),
-        float2( 0.9239f, -0.3827f), float2(-0.9239f, -0.3827f),
-        float2( 0.3827f, -0.9239f), float2(-0.3827f, -0.9239f)
-    };
-    float r4Avg = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-        r4Avg += sampleClockOccupancy(clockTexture, textureSampler, centerUV + ring4Offsets[i] * (texStep * 135.0f));
-    }
-    r4Avg *= 0.125f;
-
-    // Ring 5: 8 wide ambient halo samples at r=210 texels (~105 pt)
-    float2 ambientCenterUV = clockUV - shadowOffset * 0.45f;
-    const float2 ring5Offsets[8] = {
-        float2( 0.9808f,  0.1951f), float2(-0.9808f,  0.1951f),
-        float2( 0.1951f,  0.9808f), float2(-0.1951f,  0.9808f),
-        float2( 0.9808f, -0.1951f), float2(-0.9808f, -0.1951f),
-        float2( 0.1951f, -0.9808f), float2(-0.1951f, -0.9808f)
-    };
-    float r5Avg = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-        r5Avg += sampleClockOccupancy(clockTexture, textureSampler, ambientCenterUV + ring5Offsets[i] * (texStep * 210.0f));
-    }
-    r5Avg *= 0.125f;
-
-    // Stratified shadow layers:
-    // 1. Contact shadow: anchors immediately adjacent to digits and card edges
-    float contactShadow = centerVal * 0.30f + r1Avg * 0.40f + r2Avg * 0.30f;
-    // 2. Diffuse body shadow: soft, natural optical penumbra
-    float diffuseShadow = r2Avg * 0.30f + r3Avg * 0.45f + r4Avg * 0.25f;
-    // 3. Ambient halo: very broad, soft dark atmospheric pillow behind clock/widgets
-    float ambientHalo = r3Avg * 0.20f + r4Avg * 0.45f + r5Avg * 0.35f;
-
-    // Smooth photographic curve without harsh step cutoffs:
-    float softShadow = 1.0f - exp(-(1.5f * ambientHalo + 2.2f * diffuseShadow + 1.8f * contactShadow));
-    return clamp(softShadow, 0.0f, 1.0f);
+    float shadowVal = accum / totalWeight;
+    return clamp(shadowVal, 0.0f, 1.0f);
 }
 
 // MARK: - Progressive Optical Defocus & Native Variable Blur
@@ -795,7 +757,7 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
 
             // Very blurred drop & ambient shadow cast underneath the clock onto the screen surface
             float shadowVal = sampleClockShadow(uv, clockTexture, textureSampler, 0.0f, 0.0f);
-            float shadowAmount = shadowVal * 0.85f * uniforms.clockProgress;
+            float shadowAmount = shadowVal * 0.35f * uniforms.shadowIntensity * uniforms.clockProgress;
             base.rgb *= (1.0f - shadowAmount);
 
             float4 clockPixel = clockTexture.sample(textureSampler, uv);
@@ -1018,7 +980,7 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
             cleanPerspectiveUV.y >= -0.20f && cleanPerspectiveUV.y <= 1.20f) {
             float headParallax = uniforms.headX * uniforms.headTrackingActive;
             float shadowVal = sampleClockShadow(cleanPerspectiveUV, clockTexture, textureSampler, tiltAmount, headParallax);
-            float shadowAmount = shadowVal * 0.88f * uniforms.clockProgress;
+            float shadowAmount = shadowVal * 0.38f * uniforms.shadowIntensity * uniforms.clockProgress;
             frameColor.rgb *= (1.0f - shadowAmount);
         }
 
@@ -1071,106 +1033,4 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]],
     return frameColor;
 }
 
-// MARK: - External Display Shader (Zoom Out, Progressive Blur, and Darken)
-struct ExternalDisplayUniforms {
-    float angle;            // Lid angle in radians
-    float settleProgress;   // 0.0 (active) to 1.0 (settled back to flat 1:1)
-    float maxZoomOut;       // Max zoom-out factor (e.g. 0.10)
-    float maxBlur;          // Max blur factor (0.0 to 1.0)
-    float maxDarken;        // Max darken factor (0.0 to 1.0)
-    float aspect;           // Display aspect ratio
-    float transitionBlur;   // Quick entrance blur factor (1.0 = blurred on entry, 0.0 = clear)
-    float pad0;
-};
-
-fragment float4 fragment_external_display(RasterizerData in [[stage_in]],
-                                         texture2d<float> screenTexture [[texture(0)]],
-                                         texture2d<float> blurredTexture [[texture(1)]],
-                                         sampler textureSampler [[sampler(0)]],
-                                         constant ExternalDisplayUniforms &uniforms [[buffer(0)]]) {
-    float2 uv = in.texCoords;
-    const float uprightRad = 1.5707963f; // 90° in radians
-
-    // When fully settled, return clean original
-    if (uniforms.settleProgress >= 0.999f) {
-        return screenTexture.sample(textureSampler, uv);
-    }
-
-    // Blend target angle toward upright 90° when settling
-    float targetAngle = mix(uniforms.angle, uprightRad, clamp(uniforms.settleProgress, 0.0f, 1.0f));
-    float currentTheta = min(targetAngle, uprightRad);
-    float delta = uprightRad - currentTheta;
-
-    float2 screenTexStep = float2(1.0f / max(float(screenTexture.get_width()), 1.0f),
-                                  1.0f / max(float(screenTexture.get_height()), 1.0f));
-
-    if (delta <= 0.0001f) {
-        float4 base = screenTexture.sample(textureSampler, uv);
-        if (uniforms.transitionBlur > 0.001f) {
-            base = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, uv, uniforms.transitionBlur, screenTexStep);
-        }
-        return base;
-    }
-
-    // Normalized progress: 0.0 at 90°, 1.0 at 15°
-    float progress = clamp(delta / (75.0f * (3.14159265f / 180.0f)), 0.0f, 1.0f);
-    float smoothP = smoothstep(0.0f, 1.0f, progress);
-
-    // Settle factor: 1.0 when active, ramps to 0.0 during settle tween
-    float settleFactor = 1.0f - clamp(uniforms.settleProgress, 0.0f, 1.0f);
-    float activeProgress = smoothP * settleFactor;
-
-    // 1. Progressive Zoom Out from screen center (no perspective / keystone)
-    float zoomOutAmount = clamp(uniforms.maxZoomOut, 0.02f, 0.35f) * activeProgress;
-    float scale = max(1.0f - zoomOutAmount, 0.40f);
-    float2 centeredUV = (uv - 0.5f) / scale + 0.5f;
-
-    // Progressive blur intensity
-    float blurFactor = clamp(activeProgress * uniforms.maxBlur, 0.0f, 1.0f);
-
-    // Dynamic rounded corner radius and soft optical blur falloff
-    // cornerRadius provides a smooth Apple-style rounded window boundary
-    // edgeBlurSpread softens the perimeter into a seamless Gaussian blur halo
-    float cornerRadius = mix(0.002f, 0.090f, activeProgress);
-    float edgeBlurSpread = mix(0.002f, 0.070f, blurFactor);
-
-    // Aspect-corrected rounded box SDF (sdRoundedBox)
-    // Eliminates diagonal miter creases by evaluating true circular Euclidean distance at corners
-    float2 aspectScale = float2(uniforms.aspect, 1.0f);
-    float2 p = abs(centeredUV - 0.5f) * aspectScale;
-    float2 halfSize = float2(0.5f * uniforms.aspect, 0.5f);
-    float2 q = p - halfSize + float2(cornerRadius);
-
-    float outsideDist = length(max(q, float2(0.0f)));
-    float insideDist = min(max(q.x, q.y), 0.0f);
-    float sdf = outsideDist + insideDist - cornerRadius;
-
-    // Early exit if completely beyond the soft blurred edge falloff
-    if (sdf > edgeBlurSpread) {
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    }
-
-    // 2. Progressive Blur: sample textures with clamped coordinates to allow seamless outward edge bleed
-    float2 sampleUV = clamp(centeredUV, 0.0f, 1.0f);
-    float effectiveExternalBlur = blurFactor;
-    if (uniforms.transitionBlur > 0.001f) {
-        effectiveExternalBlur = max(effectiveExternalBlur, uniforms.transitionBlur);
-    }
-    float4 col = sampleProgressiveBlur(screenTexture, blurredTexture, textureSampler, sampleUV, effectiveExternalBlur, screenTexStep);
-
-    // 3. Progressive Darkening & Vignette
-    float darkenFactor = clamp(activeProgress * uniforms.maxDarken, 0.0f, 0.85f);
-    float2 vignetteOffset = (uv - 0.5f) * float2(uniforms.aspect, 1.0f);
-    float vignetteDist = length(vignetteOffset);
-    float vignette = smoothstep(0.35f, 1.15f, vignetteDist) * 0.20f * activeProgress;
-
-    col.rgb *= (1.0f - darkenFactor) * (1.0f - vignette);
-
-    // 4. Soft Rounded Edge Blur Falloff
-    // Smoothly blends from full opacity inside to zero opacity outside along the rounded contour
-    float edgeAlpha = 1.0f - smoothstep(-edgeBlurSpread, edgeBlurSpread, sdf);
-    col.rgb = mix(float3(0.0f, 0.0f, 0.0f), col.rgb, edgeAlpha);
-
-    return col;
-}
 

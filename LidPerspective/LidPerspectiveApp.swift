@@ -31,14 +31,7 @@ struct LidPerspectiveApp: App {
     var body: some Scene {
         // Background Menu Bar Extra (Persistent agent in macOS menu bar)
         MenuBarExtra("LidPerspective", systemImage: "laptopcomputer.and.arrow.down") {
-            MenuBarMenuView(
-                sensor: sensor,
-                captureManager: captureManager,
-                autoManager: autoManager,
-                overlayController: overlayController,
-                bootstrap: bootstrap,
-                headTracker: headTracker
-            )
+            MenuBarMenuView(autoManager: autoManager)
         }
 
         // Auxiliary Settings Window (Openable from Menu Bar or on launch)
@@ -58,153 +51,24 @@ struct LidPerspectiveApp: App {
 
 // MARK: - Menu Bar View (Agent Interface)
 struct MenuBarMenuView: View {
-    let sensor: LidSensor
-    @ObservedObject var captureManager: ScreenCaptureManager
     @ObservedObject var autoManager: AutoPerspectiveManager
-    @ObservedObject var overlayController: FullscreenOverlayController
-    @ObservedObject var bootstrap: AppBootstrap
-    @ObservedObject var headTracker: HeadTracker
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("LidPerspective Agent")
-                .font(.headline)
-
-            Text("Status: \(autoManager.statusDescription)")
-                .font(.caption)
-
-            Divider()
-
             Toggle("Automatic Perspective (<90°)", isOn: $autoManager.isAutoModeEnabled)
             Toggle("Auto-Settle Below 90°", isOn: $autoManager.isAutoSettleEnabled)
-            Toggle("Perspective Clock (Auto-Settle Off)", isOn: $autoManager.isClockModeEnabled)
-                .disabled(autoManager.isAutoSettleEnabled)
-
-            if autoManager.isClockModeEnabled {
-                Menu("Clock Position") {
-                    Section("Top") {
-                        ForEach([ClockPosition.topLeading, .top, .topTrailing]) { pos in
-                            Button {
-                                overlayController.viewState.clockPosition = pos
-                            } label: {
-                                if overlayController.viewState.clockPosition == pos {
-                                    Label(pos.rawValue, systemImage: "checkmark")
-                                } else {
-                                    Text(pos.rawValue)
-                                }
-                            }
-                        }
-                    }
-                    Section("Center") {
-                        ForEach([ClockPosition.leading, .center, .trailing]) { pos in
-                            Button {
-                                overlayController.viewState.clockPosition = pos
-                            } label: {
-                                if overlayController.viewState.clockPosition == pos {
-                                    Label(pos.rawValue, systemImage: "checkmark")
-                                } else {
-                                    Text(pos.rawValue)
-                                }
-                            }
-                        }
-                    }
-                    Section("Bottom") {
-                        ForEach([ClockPosition.bottomLeading, .bottom, .bottomTrailing]) { pos in
-                            Button {
-                                overlayController.viewState.clockPosition = pos
-                            } label: {
-                                if overlayController.viewState.clockPosition == pos {
-                                    Label(pos.rawValue, systemImage: "checkmark")
-                                } else {
-                                    Text(pos.rawValue)
-                                }
-                            }
-                        }
-                    }
-                }
-                .disabled(autoManager.isAutoSettleEnabled)
-
-                Menu("Clock Size") {
-                    ForEach(ClockSize.allCases) { size in
-                        Button {
-                            overlayController.viewState.clockSize = size
-                        } label: {
-                            if overlayController.viewState.clockSize == size {
-                                Label(size.rawValue, systemImage: "checkmark")
-                            } else {
-                                Text(size.rawValue)
-                            }
-                        }
-                    }
-                }
-                .disabled(autoManager.isAutoSettleEnabled)
-
-                Toggle("StandBy Calendar & Clock Style", isOn: overlayController.standByStyleBinding)
-                    .disabled(autoManager.isAutoSettleEnabled)
-            }
-
-            Menu("Viewing Perspective Reference") {
-                ForEach(HeadTrackingMode.allCases) { mode in
-                    Button {
-                        headTracker.mode = mode
-                    } label: {
-                        if headTracker.mode == mode {
-                            Label(mode.rawValue, systemImage: "checkmark")
-                        } else {
-                            Text(mode.rawValue)
-                        }
-                    }
-                }
-            }
-            if headTracker.mode != .disabled {
-                if headTracker.isTrackingFace {
-                    Text(String(format: "Reference: (X: %+.2f, Y: %+.2f, Dist: %.2fx)", headTracker.currentHeadX, headTracker.currentHeadY, headTracker.currentHeadZ))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                } else if headTracker.mode == .snapshotOnClose {
-                    Text("Snaps face once when lid starts closing")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Searching for face...")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Toggle("External Monitor Ambient Effect", isOn: $autoManager.isExternalDisplayEnabled)
-            Toggle("Frosted Glass Effect", isOn: overlayController.frostedGlassBinding)
-            Toggle("Simulated Keyboard Reflection", isOn: overlayController.keyboardReflectionBinding)
-
-            Menu("Texture Resolution Quality") {
-                ForEach(TextureResolutionQuality.allCases) { quality in
-                    Button {
-                        captureManager.textureQuality = quality
-                    } label: {
-                        if captureManager.textureQuality == quality {
-                            Label(quality.rawValue, systemImage: "checkmark")
-                        } else {
-                            Text(quality.rawValue)
-                        }
-                    }
-                }
-            }
 
             Divider()
 
             Button {
-                autoManager.triggerPerspective(showCalibrator: true)
-            } label: {
-                Label("Open Calibrator HUD (or Press 'C')", systemImage: "slider.horizontal.2.square")
-            }
-
-            Button {
-                NSApp.activate(ignoringOtherApps: true)
+                NSApp.setActivationPolicy(.regular)
                 openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
             } label: {
-                Label("Open Settings & Diagnostics Window...", systemImage: "gearshape")
+                Label("Settings…", systemImage: "gearshape")
             }
+            .keyboardShortcut(",", modifiers: .command)
 
             Divider()
 
@@ -218,12 +82,31 @@ struct MenuBarMenuView: View {
     }
 }
 
+// MARK: - Settings Tab Definition
+private enum SettingsTab: String, CaseIterable, Identifiable {
+    case general = "General"
+    case effects = "Effects"
+    case clock = "Clock"
+    case tracking = "Tracking & Sensor"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .general: return "gearshape"
+        case .effects: return "sparkles"
+        case .clock: return "clock"
+        case .tracking: return "person.crop.circle"
+        }
+    }
+}
+
 // MARK: - Sensor Readings Box (Isolated View to Prevent Global Invalidation)
 private struct SensorReadingsBox: View {
     @ObservedObject var sensor: LidSensor
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             HStack {
                 Text("Lid Hinge Angle")
                     .font(.subheadline)
@@ -252,9 +135,47 @@ private struct SensorReadingsBox: View {
                     .foregroundStyle(sensor.isAvailable ? .green : .orange)
             }
         }
-        .padding()
+        .padding(12)
         .background(.quaternary.opacity(0.4))
         .cornerRadius(10)
+    }
+}
+
+// MARK: - Shortcuts Guide Box
+private struct ShortcutsGuideBox: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Keyboard Shortcuts (While Lid <90°)")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                GridRow {
+                    Text("C").font(.caption.bold().monospaced())
+                    Text("Open / Close Calibrator HUD").font(.caption).foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("T").font(.caption.bold().monospaced())
+                    Text("Toggle 3D Perspective Clock").font(.caption).foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("F").font(.caption.bold().monospaced())
+                    Text("Toggle Frosted Glass Effect").font(.caption).foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("K").font(.caption.bold().monospaced())
+                    Text("Toggle Keyboard Reflection").font(.caption).foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("ESC").font(.caption.bold().monospaced())
+                    Text("Exit Perspective Overlay").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.3))
+        .cornerRadius(8)
     }
 }
 
@@ -267,21 +188,22 @@ struct ContentView: View {
     @ObservedObject var autoManager: AutoPerspectiveManager
     @ObservedObject var headTracker: HeadTracker
 
+    @State private var selectedTab: SettingsTab = .general
     @State private var isRunningDiagnostics: Bool = false
     @State private var diagnosticMessage: String? = nil
     @State private var keyMonitor: Any? = nil
 
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 12) {
             // Header with status indicator
             HStack(spacing: 12) {
                 Image(systemName: "laptopcomputer.and.arrow.down")
-                    .font(.system(size: 32))
+                    .font(.system(size: 26))
                     .foregroundStyle(.tint)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("GlassBook")
-                        .font(.title2.bold())
+                        .font(.title3.bold())
                     Text("Simulates a glass door effect when the lid is tilted below 90 degrees")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -290,453 +212,50 @@ struct ContentView: View {
                 Spacer()
 
                 // Armed status badge
-                Circle()
-                    .fill(statusIndicatorColor)
-                    .frame(width: 12, height: 12)
-            }
-
-            Divider()
-
-            // Sensor Readings Box (Isolated)
-            SensorReadingsBox(sensor: sensor)
-
-            // Automation Settings
-            VStack(spacing: 12) {
-                Toggle(isOn: $autoManager.isAutoModeEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Enable Automatic Perspective")
-                            .font(.body.weight(.medium))
-                        Text("Automatically takes a screenshot and engages perspective view when the lid passes below 90°.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Auto-Return to Usable Desktop")
-                                .font(.body.weight(.medium))
-                            Text(autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0
-                                ? "When the lid is paused below 90° for >\(autoManager.formattedDelay), smoothly unwarps and fades out back to the interactive desktop."
-                                : "Auto-return disabled. Perspective view remains active until lid is opened past 90° or ESC is pressed.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Text(autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0
-                            ? String(format: "%.1f s", autoManager.autoSettleDelay)
-                            : "Off")
-                            .font(.callout.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0 ? .primary : .secondary)
-                    }
-
-                    Slider(
-                        value: Binding(
-                            get: {
-                                autoManager.isAutoSettleEnabled ? autoManager.autoSettleDelay : 0.0
-                            },
-                            set: { newValue in
-                                let currentVal = autoManager.isAutoSettleEnabled ? autoManager.autoSettleDelay : 0.0
-                                let stepVal = (newValue * 2.0).rounded() / 2.0
-                                if abs(currentVal - stepVal) > 0.05 {
-                                    NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
-                                }
-                                if stepVal <= 0 {
-                                    autoManager.autoSettleDelay = 0
-                                    autoManager.isAutoSettleEnabled = false
-                                } else {
-                                    autoManager.autoSettleDelay = min(3.0, stepVal)
-                                    autoManager.isAutoSettleEnabled = true
-                                }
-                            }
-                        ),
-                        in: 0...3,
-                        step: 0.5,
-                        label: {
-                            Text("Auto-Return Delay")
-                        },
-                        minimumValueLabel: {
-                            Text("Off (0s)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        },
-                        maximumValueLabel: {
-                            Text("3s")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        },
-                        tick: { val in
-                            SliderTick(val) {
-                                if val == 0 {
-                                    Text("Off")
-                                } else if val == 1.0 {
-                                    Text("1s")
-                                } else if val == 2.0 {
-                                    Text("2s")
-                                } else if val == 3.0 {
-                                    Text("3s")
-                                }
-                            }
-                        }
-                    )
-                    .sensoryFeedback(.levelChange, trigger: autoManager.autoSettleDelay)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Divider()
-
-                // Perspective Clock Mode (Engaged when Auto-Return is Off)
-                Toggle(isOn: $autoManager.isClockModeEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Perspective Clock Mode")
-                                .font(.body.weight(.medium))
-                            if autoManager.isAutoSettleEnabled {
-                                Text("(Active when Auto-Return is Off)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        Text("When Auto-Return is off, dims the desktop and projects a 3D perspective digital clock after 3 seconds of the lid remaining stationary.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(autoManager.isAutoSettleEnabled)
-
-                if autoManager.isClockModeEnabled {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Position")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: overlayController.clockPositionBinding) {
-                                Section("Top") {
-                                    Text("Top Left").tag(ClockPosition.topLeading)
-                                    Text("Top").tag(ClockPosition.top)
-                                    Text("Top Right").tag(ClockPosition.topTrailing)
-                                }
-                                Section("Center") {
-                                    Text("Center Left").tag(ClockPosition.leading)
-                                    Text("Center").tag(ClockPosition.center)
-                                    Text("Center Right").tag(ClockPosition.trailing)
-                                }
-                                Section("Bottom") {
-                                    Text("Bottom Left").tag(ClockPosition.bottomLeading)
-                                    Text("Bottom").tag(ClockPosition.bottom)
-                                    Text("Bottom Right").tag(ClockPosition.bottomTrailing)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .frame(width: 150)
-                        }
-
-                        HStack {
-                            Text("Size")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: overlayController.clockSizeBinding) {
-                                ForEach(ClockSize.allCases) { size in
-                                    Text(size.rawValue).tag(size)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                            .frame(width: 230)
-                        }
-
-                        Divider()
-
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("StandBy Calendar & Clock Style")
-                                    .font(.subheadline.weight(.medium))
-                                Text("Replaces the single digital clock with the Apple StandBy dual layout: day/month and monthly calendar on the left, and a squircle analog clock on the right.")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Toggle("", isOn: overlayController.standByStyleBinding)
-                                .labelsHidden()
-                                .toggleStyle(.switch)
-                        }
-                    }
-                    .padding(.leading, 18)
-                    .padding(.vertical, 4)
-                    .disabled(autoManager.isAutoSettleEnabled)
-                }
-
-                Divider()
-
-                Toggle(isOn: overlayController.frostedGlassBinding) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Frosted Glass Effect")
-                            .font(.body.weight(.medium))
-                        Text("Simulates an acid-etched frosted glass pane with a visible tactile grain pattern, micro-facet refraction, and Fresnel sheen.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Divider()
-
-                Toggle(isOn: overlayController.keyboardReflectionBinding) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Simulated Keyboard Reflection")
-                            .font(.body.weight(.medium))
-                        Text("Simulates specular laptop keyboard reflection on the screen glass between 45° and 90°.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text("Viewing Angle Adaptation")
-                                    .font(.body.weight(.medium))
-                                if headTracker.mode != .disabled {
-                                    Circle()
-                                        .fill(headTracker.isTrackingFace ? Color.green : (headTracker.isSnapping ? Color.blue : Color.orange))
-                                        .frame(width: 8, height: 8)
-                                }
-                            }
-                            Text(headTracker.mode.shortDescription)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-
-                        Picker("", selection: $headTracker.mode) {
-                            ForEach(HeadTrackingMode.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(width: 220)
-                    }
-
-                    if headTracker.mode != .disabled {
-                        VStack(spacing: 8) {
-                            HStack {
-                                Text("Camera Access")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                if headTracker.authorizationStatus == .authorized {
-                                    Text("Authorized")
-                                        .font(.caption.bold())
-                                        .foregroundStyle(.green)
-                                } else if headTracker.authorizationStatus == .notDetermined {
-                                    Button("Grant Access…") {
-                                        headTracker.requestPermission()
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .controlSize(.small)
-                                } else {
-                                    Text("Denied")
-                                        .font(.caption.bold())
-                                        .foregroundStyle(.red)
-                                }
-                            }
-
-                            if headTracker.authorizationStatus == .denied {
-                                HStack {
-                                    Text("Camera permission is denied. Enable it in macOS System Settings.")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Button("Open Settings…") {
-                                        headTracker.openCameraSettings()
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .controlSize(.small)
-                                }
-                                .padding(.top, 2)
-                            }
-
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(headTracker.mode == .snapshotOnClose ? "Viewing Reference" : "Live Tracking")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    if headTracker.isTrackingFace {
-                                        HStack(spacing: 12) {
-                                            Text(String(format: "X: %+.2f", headTracker.currentHeadX))
-                                            Text(String(format: "Y: %+.2f", headTracker.currentHeadY))
-                                            Text(String(format: "Dist: %.2fx", headTracker.currentHeadZ))
-                                        }
-                                        .font(.caption2.monospacedDigit().bold())
-                                        .foregroundStyle(.primary)
-                                    } else {
-                                        Text(headTracker.isSnapping ? "Snapping face photo..." : "No reference snapped yet (Close lid to snap)")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-
-                                Spacer()
-
-                                Button {
-                                    headTracker.captureFaceSnapshot(force: true)
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        if headTracker.isSnapping {
-                                            ProgressView()
-                                                .controlSize(.mini)
-                                        } else {
-                                            Image(systemName: "camera.viewfinder")
-                                        }
-                                        Text(headTracker.isSnapping ? "Snapping…" : "Capture Reference Now")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                .disabled(headTracker.authorizationStatus != .authorized || headTracker.isSnapping)
-                            }
-                        }
-                        .padding(10)
-                        .background(.quaternary.opacity(0.35))
-                        .cornerRadius(8)
-                    }
-                }
-
-                Divider()
-
-                Toggle(isOn: $autoManager.isExternalDisplayEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("External Display Ambient Animation")
-                            .font(.body.weight(.medium))
-                        Text("Simultaneously zooms out, progressively blurs, and darkens connected external displays (no perspective distortion). Always auto-settles so your main/external workspace remains usable.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Texture Resolution & Memory Profile")
-                                .font(.body.weight(.medium))
-                            Text("Scales snapshot and blur texture memory by up to 90% without perceptible loss under 3D warp.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Picker("", selection: $captureManager.textureQuality) {
-                            ForEach(TextureResolutionQuality.allCases) { quality in
-                                Text(quality.rawValue).tag(quality)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(width: 220)
-                    }
-                }
-
-                Divider()
-
-                Toggle(isOn: $overlayController.viewState.isTransitionBlurEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Quick Blur & Fade Transition")
-                            .font(.body.weight(.medium))
-                        Text("Softly blurs and fades between the live desktop and snapshot when perspective activates.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .toggleStyle(.switch)
-            .padding()
-            .background(.quaternary.opacity(0.4))
-            .cornerRadius(10)
-
-            // Automation Status
-            HStack {
-                Text("Automation Status:")
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
-                Text(autoManager.statusDescription)
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                Spacer()
-            }
-            .padding(.horizontal, 4)
-
-            // Secondary actions
-            HStack(spacing: 12) {
-                Button {
-                    autoManager.triggerPerspective(showCalibrator: true)
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "slider.horizontal.2.square")
-                        Text("Launch Calibrator HUD Now")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-
-                Button {
-                    runDiagnostics()
-                } label: {
-                    HStack {
-                        if isRunningDiagnostics {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: "stethoscope")
-                        }
-                        Text("Run Diagnostics")
-                    }
-                }
-                .buttonStyle(.bordered)
-                .disabled(isRunningDiagnostics)
-
-                if let message = diagnosticMessage {
-                    Text(message)
-                        .font(.caption)
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(statusIndicatorColor)
+                        .frame(width: 8, height: 8)
+                    Text(autoManager.statusDescription)
+                        .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.5))
+                .clipShape(Capsule())
             }
+
+            // Tab Selector
+            Picker("Settings Tab", selection: $selectedTab) {
+                ForEach(SettingsTab.allCases) { tab in
+                    Label(tab.rawValue, systemImage: tab.icon).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
             Divider()
 
-            // Instructions footer
-            VStack(alignment: .leading, spacing: 4) {
-                Label("Closing lid (<90°) captures screen and warps in real time", systemImage: "sparkles")
-                Label("When lid is tilted, press 'C' for Calibrator HUD, 'M' for Head Tracking Mode, 'T' for Clock, 'F' for Frosted, or 'K' for Keyboard", systemImage: "slider.horizontal.2.square.badge.arrow.down")
-                Label("Use [↑/↓] and [←/→] to navigate and tune perspective parameters", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
-                if autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0 {
-                    Label("Stopping movement (<90°) unwarps and returns to desktop after \(autoManager.formattedDelay)", systemImage: "arrow.triangle.2.circlepath")
-                } else if autoManager.isClockModeEnabled {
-                    Label("Stopping movement (<90°) dims desktop and shows perspective clock after 3s", systemImage: "clock")
-                } else {
-                    Label("Stopping movement (<90°) keeps perspective active (auto-return off)", systemImage: "arrow.triangle.2.circlepath")
+            // Tab Content
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 12) {
+                    switch selectedTab {
+                    case .general:
+                        generalTabContent
+                    case .effects:
+                        effectsTabContent
+                    case .clock:
+                        clockTabContent
+                    case .tracking:
+                        trackingTabContent
+                    }
                 }
-                Label("External displays always auto-settle to keep your workspace usable", systemImage: "display.2")
-                Label("Open lid past 90° or press ESC to exit", systemImage: "info.circle")
+                .padding(.vertical, 2)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(24)
-        .frame(width: 440)
+        .padding(18)
+        .frame(width: 520, height: 460)
         .background(WindowAccessor { window in
             window.title = "LidPerspective Settings"
             window.identifier = NSUserInterfaceItemIdentifier("settings")
@@ -745,6 +264,8 @@ struct ContentView: View {
             overlayController.viewState.isSettingsWindowFocused = true
         })
         .onAppear {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
             overlayController.viewState.isSettingsWindowOpen = true
             setupKeyMonitor()
             headTracker.retainTracking()
@@ -754,6 +275,18 @@ struct ContentView: View {
             if let monitor = keyMonitor {
                 NSEvent.removeMonitor(monitor)
                 keyMonitor = nil
+            }
+            overlayController.viewState.isSettingsWindowOpen = false
+            overlayController.viewState.isSettingsWindowFocused = false
+            // When Settings closes, hide from Dock and run quietly in the background
+            NSApp.setActivationPolicy(.accessory)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
+            if let window = notification.object as? NSWindow,
+               window == overlayController.viewState.settingsWindow || window.identifier?.rawValue == "settings" || window.title.contains("Settings") {
+                overlayController.viewState.isSettingsWindowOpen = false
+                overlayController.viewState.isSettingsWindowFocused = false
+                NSApp.setActivationPolicy(.accessory)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
@@ -807,6 +340,418 @@ struct ContentView: View {
         .onKeyPress(KeyEquivalent("T")) {
             if handleKeyPress("t") { return .handled }
             return .ignored
+        }
+    }
+
+    // MARK: - Tab Views
+    @ViewBuilder
+    private var generalTabContent: some View {
+        VStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle(isOn: $autoManager.isAutoModeEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Enable Automatic Perspective")
+                            .font(.body.weight(.medium))
+                        Text("Automatically takes a screenshot and engages perspective view when the lid passes below 90°.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Auto-Return to Usable Desktop")
+                                .font(.body.weight(.medium))
+                            Text(autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0
+                                ? "When the lid is paused below 90° for >\(autoManager.formattedDelay), smoothly unwarps and fades out back to desktop."
+                                : "Auto-return disabled. Perspective view remains active until lid is opened past 90° or ESC is pressed.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0
+                            ? String(format: "%.1f s", autoManager.autoSettleDelay)
+                            : "Off")
+                            .font(.callout.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(autoManager.isAutoSettleEnabled && autoManager.autoSettleDelay > 0 ? .primary : .secondary)
+                    }
+
+                    Slider(
+                        value: Binding(
+                            get: {
+                                autoManager.isAutoSettleEnabled ? autoManager.autoSettleDelay : 0.0
+                            },
+                            set: { newValue in
+                                let currentVal = autoManager.isAutoSettleEnabled ? autoManager.autoSettleDelay : 0.0
+                                let stepVal = (newValue * 2.0).rounded() / 2.0
+                                if abs(currentVal - stepVal) > 0.05 {
+                                    NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+                                }
+                                if stepVal <= 0 {
+                                    autoManager.autoSettleDelay = 0
+                                    autoManager.isAutoSettleEnabled = false
+                                } else {
+                                    autoManager.autoSettleDelay = min(3.0, stepVal)
+                                    autoManager.isAutoSettleEnabled = true
+                                }
+                            }
+                        ),
+                        in: 0...3,
+                        step: 0.5,
+                        label: {
+                            Text("Auto-Return Delay")
+                        },
+                        minimumValueLabel: {
+                            Text("Off (0s)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        },
+                        maximumValueLabel: {
+                            Text("3s")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    )
+                    .sensoryFeedback(.levelChange, trigger: autoManager.autoSettleDelay)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .toggleStyle(.switch)
+            .padding()
+            .background(.quaternary.opacity(0.4))
+            .cornerRadius(10)
+
+            // Actions card
+            VStack(spacing: 10) {
+                HStack(spacing: 12) {
+                    Button {
+                        autoManager.triggerPerspective(showCalibrator: true)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "slider.horizontal.2.square")
+                            Text("Launch Calibrator HUD")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button {
+                        runDiagnostics()
+                    } label: {
+                        HStack(spacing: 6) {
+                            if isRunningDiagnostics {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "stethoscope")
+                            }
+                            Text("Run Diagnostics")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isRunningDiagnostics)
+                }
+
+                if let message = diagnosticMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(12)
+            .background(.quaternary.opacity(0.25))
+            .cornerRadius(10)
+        }
+    }
+
+    @ViewBuilder
+    private var effectsTabContent: some View {
+        VStack(spacing: 12) {
+            Toggle(isOn: overlayController.frostedGlassBinding) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Frosted Glass Effect")
+                        .font(.body.weight(.medium))
+                    Text("Simulates an acid-etched frosted glass pane with a visible tactile grain pattern, micro-facet refraction, and Fresnel sheen.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Divider()
+
+            Toggle(isOn: overlayController.keyboardReflectionBinding) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Simulated Keyboard Reflection")
+                        .font(.body.weight(.medium))
+                    Text("Simulates specular laptop keyboard reflection on the screen glass between 45° and 90°.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Divider()
+
+            Toggle(isOn: $overlayController.viewState.isTransitionBlurEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Quick Blur & Fade Transition")
+                        .font(.body.weight(.medium))
+                    Text("Softly blurs and fades between the live desktop and snapshot when perspective activates.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Divider()
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Texture Quality & Memory Profile")
+                        .font(.body.weight(.medium))
+                    Text("Scales snapshot and blur texture memory by up to 90% without perceptible loss.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Picker("", selection: $captureManager.textureQuality) {
+                    ForEach(TextureResolutionQuality.allCases) { quality in
+                        Text(quality.rawValue).tag(quality)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 200)
+            }
+        }
+        .toggleStyle(.switch)
+        .padding()
+        .background(.quaternary.opacity(0.4))
+        .cornerRadius(10)
+    }
+
+    @ViewBuilder
+    private var clockTabContent: some View {
+        VStack(spacing: 12) {
+            Toggle(isOn: $autoManager.isClockModeEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Perspective Clock Mode")
+                            .font(.body.weight(.medium))
+                        if autoManager.isAutoSettleEnabled {
+                            Text("(Active when Auto-Return is Off)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    Text("When Auto-Return is off, dims the desktop and projects a 3D perspective digital clock after 3 seconds of the lid remaining stationary.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(autoManager.isAutoSettleEnabled)
+
+            if autoManager.isClockModeEnabled {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Position")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Picker("", selection: overlayController.clockPositionBinding) {
+                            Section("Top") {
+                                Text("Top Left").tag(ClockPosition.topLeading)
+                                Text("Top").tag(ClockPosition.top)
+                                Text("Top Right").tag(ClockPosition.topTrailing)
+                            }
+                            Section("Center") {
+                                Text("Center Left").tag(ClockPosition.leading)
+                                Text("Center").tag(ClockPosition.center)
+                                Text("Center Right").tag(ClockPosition.trailing)
+                            }
+                            Section("Bottom") {
+                                Text("Bottom Left").tag(ClockPosition.bottomLeading)
+                                Text("Bottom").tag(ClockPosition.bottom)
+                                Text("Bottom Right").tag(ClockPosition.bottomTrailing)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 160)
+                    }
+
+                    HStack {
+                        Text("Size")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Picker("", selection: overlayController.clockSizeBinding) {
+                            ForEach(ClockSize.allCases) { size in
+                                Text(size.rawValue).tag(size)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 240)
+                    }
+
+                    Divider()
+
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("StandBy Calendar & Clock Style")
+                                .font(.subheadline.weight(.medium))
+                            Text("Replaces single digital clock with Apple StandBy dual calendar & analog clock layout.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Toggle("", isOn: overlayController.standByStyleBinding)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                    }
+                }
+                .disabled(autoManager.isAutoSettleEnabled)
+            }
+        }
+        .toggleStyle(.switch)
+        .padding()
+        .background(.quaternary.opacity(0.4))
+        .cornerRadius(10)
+    }
+
+    @ViewBuilder
+    private var trackingTabContent: some View {
+        VStack(spacing: 12) {
+            // Viewing Angle Adaptation
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Viewing Angle Adaptation")
+                                .font(.body.weight(.medium))
+                            if headTracker.mode != .disabled {
+                                Circle()
+                                    .fill(headTracker.isTrackingFace ? Color.green : (headTracker.isSnapping ? Color.blue : Color.orange))
+                                    .frame(width: 8, height: 8)
+                            }
+                        }
+                        Text(headTracker.mode.shortDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+
+                    Picker("", selection: $headTracker.mode) {
+                        ForEach(HeadTrackingMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+
+                if headTracker.mode != .disabled {
+                    VStack(spacing: 8) {
+                        HStack {
+                            Text("Camera Access")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if headTracker.authorizationStatus == .authorized {
+                                Text("Authorized")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.green)
+                            } else if headTracker.authorizationStatus == .notDetermined {
+                                Button("Grant Access…") {
+                                    headTracker.requestPermission()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            } else {
+                                Text("Denied")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.red)
+                            }
+                        }
+
+                        if headTracker.authorizationStatus == .denied {
+                            HStack {
+                                Text("Camera permission is denied. Enable it in macOS System Settings.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Open Settings…") {
+                                    headTracker.openCameraSettings()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+                            .padding(.top, 2)
+                        }
+
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(headTracker.mode == .snapshotOnClose ? "Viewing Reference" : "Live Tracking")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if headTracker.isTrackingFace {
+                                    HStack(spacing: 10) {
+                                        Text(String(format: "X: %+.2f", headTracker.currentHeadX))
+                                        Text(String(format: "Y: %+.2f", headTracker.currentHeadY))
+                                        Text(String(format: "Dist: %.2fx", headTracker.currentHeadZ))
+                                    }
+                                    .font(.caption2.monospacedDigit().bold())
+                                    .foregroundStyle(.primary)
+                                } else {
+                                    Text(headTracker.isSnapping ? "Snapping face photo..." : "No reference snapped yet (Close lid to snap)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+
+                            Spacer()
+
+                            Button {
+                                headTracker.captureFaceSnapshot(force: true)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    if headTracker.isSnapping {
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "camera.viewfinder")
+                                    }
+                                    Text(headTracker.isSnapping ? "Snapping…" : "Capture Now")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(headTracker.authorizationStatus != .authorized || headTracker.isSnapping)
+                        }
+                    }
+                    .padding(10)
+                    .background(.quaternary.opacity(0.35))
+                    .cornerRadius(8)
+                }
+            }
+            .padding()
+            .background(.quaternary.opacity(0.4))
+            .cornerRadius(10)
+
+            // Live Sensor Readings Box
+            SensorReadingsBox(sensor: sensor)
+
+            // Shortcuts Guide
+            ShortcutsGuideBox()
         }
     }
 
@@ -942,4 +887,3 @@ private struct WindowAccessor: NSViewRepresentable {
         }
     }
 }
-

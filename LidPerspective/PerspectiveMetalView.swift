@@ -147,6 +147,20 @@ struct PerspectiveMetalView: NSViewRepresentable {
             self.hasFiredFirstFrame = false
             self.introStartTime = CACurrentMediaTime()
             sensor?.resetPrediction()
+
+            // Pre-seed head tracking coordinates if already available
+            let head = headTracker.getHeadPosition()
+            if head.isTracking {
+                self.smoothedHeadX = head.x
+                self.smoothedHeadY = head.y
+                self.smoothedHeadZ = head.z
+                self.smoothedHeadActive = 1.0
+            } else {
+                self.smoothedHeadX = 0.0
+                self.smoothedHeadY = 0.0
+                self.smoothedHeadZ = 1.0
+                self.smoothedHeadActive = 0.0
+            }
         }
 
 
@@ -179,24 +193,12 @@ struct PerspectiveMetalView: NSViewRepresentable {
         }()
         private static let sharedDefaultTexture: MTLTexture? = {
             guard let device = sharedDevice else { return nil }
-            let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba8Unorm,
-                width: 1,
-                height: 1,
-                mipmapped: false
-            )
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
             desc.usage = [.shaderRead]
-            if let texture = device.makeTexture(descriptor: desc) {
-                var transparentPixel: UInt32 = 0
-                texture.replace(
-                    region: MTLRegionMake2D(0, 0, 1, 1),
-                    mipmapLevel: 0,
-                    withBytes: &transparentPixel,
-                    bytesPerRow: 4
-                )
-                return texture
-            }
-            return nil
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            var pixel: [UInt8] = [0, 0, 0, 0]
+            tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &pixel, bytesPerRow: 4)
+            return tex
         }()
 
         private var device: MTLDevice?
@@ -228,6 +230,10 @@ struct PerspectiveMetalView: NSViewRepresentable {
         private var isFirstFrame = true
         private var targetAngle: Double = 90.0
         private var smoothedAngle: Double = 90.0
+        private var smoothedHeadX: Float = 0.0
+        private var smoothedHeadY: Float = 0.0
+        private var smoothedHeadZ: Float = 1.0
+        private var smoothedHeadActive: Float = 0.0
         private var keystoneStrength: Float = 0.18
         private var stretchBalance: Float = 0.56
         private var keyboardReflection: Float = 0.44
@@ -247,6 +253,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
         private let settleDuration: CFTimeInterval = 0.28
         private var frozenAngle: Double = 90.0
         var onSettleCompleted: (() -> Void)?
+
 
         struct PerspectiveUniforms {
             var angle: Float
@@ -378,6 +385,7 @@ struct PerspectiveMetalView: NSViewRepresentable {
 
             if let clkImage = clockImage, clkImage !== lastLoadedClockID, let device = self.device {
                 self.lastLoadedClockID = clkImage
+                self.lastLoadedClockID = clkImage
                 self.clockTexture = makeTexture(from: clkImage, device: device)
             }
         }
@@ -472,16 +480,16 @@ struct PerspectiveMetalView: NSViewRepresentable {
                   let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else { return }
 
             let now = CACurrentMediaTime()
-
             var transitionBlur: Float = 0.0
+
             if isTransitionBlurEnabled && introStartTime > 0.0 {
-                let elapsed = now - introStartTime
-                let t = min(max(Float(elapsed / introDuration), 0.0), 1.0)
-                let factor = 1.0 - t
-                transitionBlur = factor * factor
-                if t >= 1.0 {
-                    introStartTime = 0.0
+                let introElapsed = now - introStartTime
+                if introElapsed < introDuration {
+                    let progress = Float(introElapsed / introDuration)
+                    transitionBlur = 1.0 - progress
+                } else {
                     transitionBlur = 0.0
+                    introStartTime = 0.0
                 }
             }
 
@@ -549,13 +557,23 @@ struct PerspectiveMetalView: NSViewRepresentable {
             let angleRadians = Float(smoothedAngle * (.pi / 180.0))
 
             let head = headTracker.getHeadPosition()
+            let headTrackingTarget: Float = head.isTracking ? 1.0 : 0.0
+
+            // Smooth head parallax over ~100-140ms to eliminate instant snaps while keeping high responsiveness
+            let headSmoothing: Float = isFirstFrame ? 1.0 : 0.16
+            self.smoothedHeadX += (head.x - self.smoothedHeadX) * headSmoothing
+            self.smoothedHeadY += (head.y - self.smoothedHeadY) * headSmoothing
+            self.smoothedHeadZ += (head.z - self.smoothedHeadZ) * headSmoothing
+            self.smoothedHeadActive += (headTrackingTarget - self.smoothedHeadActive) * headSmoothing
 
             // Dynamic frame rate scaling:
-            // Render at full 120 FPS when moving or transitioning, but scale down to 30 FPS when the lid is held stationary.
+            // Render at full 120 FPS when moving, transitioning, or smoothing head parallax,
+            // but scale down to 30 FPS when everything is stationary.
             let isAngleSettled = speed < 0.4 && abs(targetAngle - self.smoothedAngle) < 0.005
             let isIntroActive = isTransitionBlurEnabled && introStartTime > 0.0
             let isClockTransition = isClockActive ? (clockProgress < 1.0) : (clockProgress > 0.0)
-            let isHeadActive = headTracker.mode == .continuous && head.isTracking
+            let isHeadSmoothing = abs(head.x - self.smoothedHeadX) > 0.005 || abs(head.y - self.smoothedHeadY) > 0.005
+            let isHeadActive = (headTracker.mode == .continuous && head.isTracking) || isHeadSmoothing
 
             let targetFPS = (isSettling || isIntroActive || isClockTransition || !isAngleSettled || isHeadActive) ? 120 : 30
             if view.preferredFramesPerSecond != targetFPS {
@@ -599,10 +617,10 @@ struct PerspectiveMetalView: NSViewRepresentable {
                 clockProgress: self.clockProgress,
                 showClock: (self.clockTexture != nil && self.clockProgress > 0.001) ? 1.0 : 0.0,
                 transitionBlur: transitionBlur,
-                headX: head.x,
-                headY: head.y,
-                headZ: head.z,
-                headTrackingActive: head.isTracking ? 1.0 : 0.0,
+                headX: self.smoothedHeadX,
+                headY: self.smoothedHeadY,
+                headZ: self.smoothedHeadZ,
+                headTrackingActive: self.smoothedHeadActive,
                 headParallaxSensitivity: self.headParallaxSensitivity,
                 headElevationSensitivity: self.headElevationSensitivity,
                 keyboardParallaxSensitivity: self.keyboardParallaxSensitivity,

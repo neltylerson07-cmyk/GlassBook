@@ -4,7 +4,5 @@
 <dict>
 	<key>Privacy - Screen Capture Usage Description</key>
 	<string>Used to snapshot the desktop before sleep for perspective warping.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Used for head tracking to dynamically adjust the 3D perspective illusion based on your viewing angle.</string>
 </dict>
 </plist>

@@ -5,13 +5,9 @@ import Combine
 @MainActor
 final class FullscreenOverlayController: ObservableObject {
     private var builtinWindow: KeyCatchingWindow?
-    private var externalWindows: [KeyCatchingWindow] = []
 
     var window: NSWindow? { builtinWindow }
     @Published private(set) var isShowing: Bool = false
-    @Published private(set) var isExternalShowing: Bool = false
-    @Published private(set) var isExternalSettling: Bool = false
-    var onExternalSettleCompleted: (() -> Void)?
     private var onDismissal: (() -> Void)?
     @Published var viewState = OverlayViewState()
     let headTracker: HeadTracker = HeadTracker.shared
@@ -34,12 +30,6 @@ final class FullscreenOverlayController: ObservableObject {
             }
         )
     }
-
-    // External Monitor Tunable Parameters
-    @Published var externalZoomOut: Float = 0.10
-    @Published var externalBlur: Float = 1.00
-    @Published var externalDarken: Float = 0.40
-    @Published var isExternalAnimationEnabled: Bool = true
 
     var keyboardReflectionBinding: Binding<Bool> {
         Binding(
@@ -264,79 +254,7 @@ final class FullscreenOverlayController: ObservableObject {
             }
         }
 
-        // 2. Setup External Monitor Overlays (Zoom Out, Progressive Blur, and Darken)
-        if isExternalAnimationEnabled && !snapshots.externalSnapshots.isEmpty {
-            isExternalSettling = false
-            onExternalSettleCompleted = nil
-
-            for ext in snapshots.externalSnapshots {
-                let extWindow = KeyCatchingWindow(
-                    contentRect: ext.screen.frame,
-                    styleMask: [.borderless],
-                    backing: .buffered,
-                    defer: false
-                )
-                extWindow.setFrame(ext.screen.frame, display: true)
-                extWindow.hasShadow = false
-                if viewState.isTransitionBlurEnabled {
-                    extWindow.alphaValue = 0.0
-                    extWindow.isOpaque = false
-                    extWindow.backgroundColor = .clear
-                } else {
-                    extWindow.alphaValue = 1.0
-                    extWindow.isOpaque = true
-                    extWindow.backgroundColor = .black
-                }
-
-                extWindow.onEscape = { [weak self] in
-                    self?.dismiss()
-                }
-
-                // Clicking on an external window immediately auto-settles/fades it so it's instantly usable!
-                extWindow.onMouseDown = { [weak self] in
-                    self?.unwarpAndDismissExternal()
-                }
-
-                extWindow.level = NSWindow.Level(Int(CGWindowLevelForKey(.screenSaverWindow)))
-                extWindow.collectionBehavior = [
-                    .canJoinAllSpaces,
-                    .fullScreenAuxiliary,
-                    .stationary,
-                    .ignoresCycle
-                ]
-
-                let extHostView = NSHostingView(
-                    rootView: ExternalMonitorContainer(
-                        snapshot: ext.image,
-                        preloadedTexture: ext.textures?.texture,
-                        preloadedBlurredTexture: ext.textures?.blurredTexture,
-                        sensor: sensor,
-                        controller: self,
-                        onFirstFrame: nil
-                    )
-                    .ignoresSafeArea()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                )
-
-                extWindow.contentView = extHostView
-                if viewState.isTransitionBlurEnabled {
-                    extWindow.orderFront(nil)
-                    NSAnimationContext.runAnimationGroup { context in
-                        context.duration = 0.14
-                        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                        extWindow.animator().alphaValue = 1.0
-                    }
-                } else {
-                    extWindow.orderFront(nil)
-                }
-                self.externalWindows.append(extWindow)
-            }
-            self.isExternalShowing = !self.externalWindows.isEmpty
-        }
-
-        let builtinShown = (snapshots.hasBuiltin && builtinWindow != nil)
-        let externalShown = !externalWindows.isEmpty
-        self.isShowing = (builtinShown || externalShown)
+        self.isShowing = (snapshots.hasBuiltin && builtinWindow != nil)
     }
 
     /// Convenience show method for single snapshot
@@ -347,54 +265,9 @@ final class FullscreenOverlayController: ObservableObject {
         show(snapshots: snapshots, sensor: sensor, showCalibrator: showCalibrator, onDismiss: onDismiss)
     }
 
-    /// Unwarps both builtin and external overlays.
+    /// Unwarps the built-in overlay.
     func unwarpAndDismiss(completion: (() -> Void)? = nil) {
-        unwarpAndDismissBuiltin()
-        unwarpAndDismissExternal(completion: completion)
-    }
-
-    /// Smoothly unwarps and fades out only the external monitor(s) so they return to an interactive desktop.
-    func unwarpAndDismissExternal(completion: (() -> Void)? = nil) {
-        guard isExternalShowing, !isExternalSettling else {
-            completion?()
-            return
-        }
-        isExternalSettling = true
-        onExternalSettleCompleted = { [weak self] in
-            self?.fadeAndDismissExternal(completion: completion)
-        }
-    }
-
-    /// Smoothly fades out external monitor overlay windows.
-    func fadeAndDismissExternal(completion: (() -> Void)? = nil) {
-        let windows = self.externalWindows
-        self.externalWindows.removeAll()
-        self.isExternalShowing = false
-        self.isExternalSettling = false
-        self.onExternalSettleCompleted = nil
-
-        guard !windows.isEmpty else {
-            completion?()
-            return
-        }
-
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.14
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            for win in windows {
-                win.isOpaque = false
-                win.backgroundColor = .clear
-                win.animator().alphaValue = 0.0
-            }
-        }, completionHandler: {
-            for win in windows {
-                win.orderOut(nil)
-                win.contentView = nil
-            }
-            DispatchQueue.main.async {
-                completion?()
-            }
-        })
+        unwarpAndDismissBuiltin(completion: completion)
     }
 
     /// Smoothly unwarps and fades out the built-in laptop screen overlay.
@@ -427,13 +300,9 @@ final class FullscreenOverlayController: ObservableObject {
             return
         }
         activeWindow.ignoresMouseEvents = false
-        if externalWindows.isEmpty {
-            isShowing = false
-        }
+        isShowing = false
         let handler = self.onDismissal
-        if externalWindows.isEmpty {
-            self.onDismissal = nil
-        }
+        self.onDismissal = nil
 
         // Order out immediately:
         activeWindow.orderOut(nil)
@@ -442,9 +311,7 @@ final class FullscreenOverlayController: ObservableObject {
         self.viewState.currentTexture = nil
         self.viewState.currentBlurredTexture = nil
         DispatchQueue.main.async {
-            if self.externalWindows.isEmpty {
-                handler?()
-            }
+            handler?()
             completion?()
         }
     }
@@ -460,17 +327,9 @@ final class FullscreenOverlayController: ObservableObject {
             win.animator().alphaValue = 1.0
             win.ignoresMouseEvents = false
         }
-        for win in externalWindows {
-            win.animator().alphaValue = 1.0
-            win.ignoresMouseEvents = false
-        }
         if viewState.isSettling {
             viewState.isSettling = false
             viewState.onSettleCompleted = nil
-        }
-        if isExternalSettling {
-            isExternalSettling = false
-            onExternalSettleCompleted = nil
         }
     }
 
@@ -491,11 +350,8 @@ final class FullscreenOverlayController: ObservableObject {
         cancelSettling()
         deactivateClockMode()
         let activeBuiltin = builtinWindow
-        let activeExternals = externalWindows
 
-        externalWindows.removeAll()
         isShowing = false
-        isExternalShowing = false
 
         let handler = self.onDismissal
         self.onDismissal = nil
@@ -506,17 +362,9 @@ final class FullscreenOverlayController: ObservableObject {
             if let bWindow = activeBuiltin {
                 bWindow.animator().alphaValue = 0.0
             }
-            for extWindow in activeExternals {
-                extWindow.animator().alphaValue = 0.0
-            }
         }, completionHandler: {
             activeBuiltin?.orderOut(nil)
             activeBuiltin?.alphaValue = 0.0
-            for extWindow in activeExternals {
-                extWindow.orderOut(nil)
-                extWindow.alphaValue = 0.0
-                extWindow.contentView = nil
-            }
             DispatchQueue.main.async {
                 handler?()
                 completion?()
@@ -1614,39 +1462,6 @@ private struct FullscreenPerspectiveContainer: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-    }
-}
-
-// MARK: - External Monitor Container
-private struct ExternalMonitorContainer: View {
-    var snapshot: CGImage? = nil
-    var preloadedTexture: MTLTexture? = nil
-    var preloadedBlurredTexture: MTLTexture? = nil
-    let sensor: LidSensor
-    @ObservedObject var controller: FullscreenOverlayController
-    var onFirstFrame: (() -> Void)? = nil
-
-    var body: some View {
-        ExternalDisplayMetalView(
-            snapshot: snapshot,
-            preloadedTexture: preloadedTexture,
-            preloadedBlurredTexture: preloadedBlurredTexture,
-            sensor: sensor,
-            fallbackAngle: sensor.currentAngle,
-            lookahead: controller.viewState.lookaheadTime,
-            activationCount: controller.viewState.activationCount,
-            maxZoomOut: controller.externalZoomOut,
-            maxBlur: controller.externalBlur,
-            maxDarken: controller.externalDarken,
-            isSettling: controller.isExternalSettling,
-            isTransitionBlurEnabled: controller.viewState.isTransitionBlurEnabled,
-            onSettleCompleted: {
-                controller.onExternalSettleCompleted?()
-            },
-            onFirstFrame: onFirstFrame
-        )
-        .ignoresSafeArea()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
