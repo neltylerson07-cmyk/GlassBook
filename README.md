@@ -1,6 +1,6 @@
 # 🪟 GlassBook (LidPerspective)
 
-> **Real-time 3D hardware-accelerated perspective illusions and StandBy display driven by your MacBook's lid hinge sensor and head tracking (optional), inspired by iPhone Duo.**
+> **Real-time 3D hardware-accelerated perspective illusions and StandBy display driven by your MacBook's lid hinge sensor and head tracking, inspired by iPhone Duo.**
 
 [![Platform](https://img.shields.io/badge/Platform-macOS%2014.0%2B-black?style=flat&logo=apple)](https://www.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Architecture-Apple%20Silicon%20(M1--M4)-orange?style=flat)](https://www.apple.com/mac/)
@@ -15,7 +15,7 @@
 
 By tapping into Apple Silicon's undocumented internal lid angle sensor (`IOHID`) and FaceTime HD camera via Apple's Vision framework, GlassBook detects the exact tilt of your screen and position of your face in real time. Whenever you tilt your laptop lid below 90°, your active desktop instantly transforms into a realistic 3D perspective window rendered via Metal at up to **120 FPS (ProMotion)**.
 
-Tilt your screen down, and your desktop appears as if it's an angled sheet of glass suspended in 3D space, complete with physically modeled MacBook keyboard reflections, frosted glass diffusion, depth blur, and adaptive head parallax.
+Tilt your screen down, and your desktop appears as if it's an angled sheet of glass suspended in 3D space, complete with physically modeled MacBook keyboard reflections, frosted glass diffusion, depth blur, and adaptive head parallax (optional)
 
 ---
 
