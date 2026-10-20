@@ -2,7 +2,7 @@
 
 > **Real-time 3D hardware-accelerated perspective illusions and StandBy display driven by your MacBook's lid hinge sensor and head tracking, inspired by the animation featured on iPhone Duo.**
 
-Press 'C' with the settings window open to calibrate/tweak settings to your preferences.
+Press <kbd>C</kbd> with the settings window open to calibrate/tweak settings to your preferences.
 
 
 [![Platform](https://img.shields.io/badge/Platform-macOS%2014.0%2B-black?style=flat&logo=apple)](https://www.apple.com/macos/)
@@ -54,9 +54,6 @@ Tilt your screen down, and your desktop appears as if it's an angled sheet of gl
 
 ### Auto-Return to Desktop
 - **Smart Settle Delay**: Set a timer (0.5s to 3.0s, or Off) that smoothly unwarps and fades back to an interactive desktop when lid movement stops.
-
-### Interactive Calibrator HUD
-- Press <kbd>C</kbd> at any time to open the live Calibration HUD directly on the 3D surface. Adjust parameters, reflections, and shaders on the fly using arrow keys.
 
 ---
 
