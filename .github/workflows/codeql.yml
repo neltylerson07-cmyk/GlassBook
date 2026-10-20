@@ -44,7 +44,7 @@ jobs:
         run: |
           xcodebuild \
             -project LidPerspective.xcodeproj \
-            -target LidPerspective \
+            -scheme LidPerspective \
             -configuration Release \
             -derivedDataPath .build/derivedData \
             CODE_SIGNING_ALLOWED=NO \
