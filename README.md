@@ -2,7 +2,7 @@
 
 > **Real-time 3D hardware-accelerated perspective illusions and StandBy display driven by your MacBook's lid hinge sensor and head tracking, inspired by the animation featured on iPhone Duo.**
 
-Press <kbd>C</kbd> with the settings window open to calibrate/tweak settings to your preferences.
+**Press <kbd>C</kbd> with the settings window open to calibrate/tweak settings to your preferences.**
 
 
 [![Platform](https://img.shields.io/badge/Platform-macOS%2014.0%2B-black?style=flat&logo=apple)](https://www.apple.com/macos/)
